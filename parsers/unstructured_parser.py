@@ -1,186 +1,69 @@
-import dataclasses
-import tempfile
+from __future__ import annotations
+
 import os
-from typing import Iterator, Type, Any
-import numpy as np
-from langchain_community.document_loaders import UnstructuredFileLoader
-from langchain_core.document_loaders import BaseBlobParser
-from langchain_core.documents.base import Document, Blob
+import tempfile
+from typing import Any, Iterator
+
+from langchain_core.document_loaders import BaseBlobParser, Blob
+from langchain_core.documents import Document
+
+
+# Formats whose magic bytes resolve to application/zip rather than the real type.
+# We force the correct content_type so unstructured picks the right partitioner.
+_EXT_TO_MIME: dict[str, str] = {
+    ".docx":  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xlsx":  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".pptx":  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".odp":   "application/vnd.oasis.opendocument.presentation",
+    ".odt":   "application/vnd.oasis.opendocument.text",
+    ".ods":   "application/vnd.oasis.opendocument.spreadsheet",
+    ".odg":   "application/vnd.oasis.opendocument.graphics",
+}
 
 
 class UnstructuredParser(BaseBlobParser):
-    def __init__(self, document_loader_type: Type[UnstructuredFileLoader]):
-        self._document_loader_type = document_loader_type
+    """General-purpose parser backed by ``unstructured.partition.auto.partition``.
 
-    @staticmethod
-    def _serialize_metadata_value(value: Any) -> Any:
-        """Convert non-serializable values to JSON-compatible format."""
-        # Handle None
-        if value is None:
-            return None
+    Passes ``content_type`` explicitly for ZIP-based formats so that
+    libmagic mis-detection (returning ``application/zip``) does not prevent
+    the correct partitioner from being selected.
+    """
 
-        # Handle numpy types
-        if isinstance(value, (np.integer, np.floating)):
-            return float(value)
-
-        # Handle numpy arrays
-        if isinstance(value, np.ndarray):
-            return value.tolist()
-
-        # Handle tuples (convert to lists for JSON compatibility)
-        if isinstance(value, tuple):
-            return [UnstructuredParser._serialize_metadata_value(item) for item in value]
-
-        # Handle lists
-        if isinstance(value, list):
-            return [UnstructuredParser._serialize_metadata_value(item) for item in value]
-
-        # Handle dicts
-        if isinstance(value, dict):
-            return {k: UnstructuredParser._serialize_metadata_value(v) for k, v in value.items()}
-
-        # Handle Pydantic v2 models (unstructured >= 0.10 usa Pydantic v2)
-        if hasattr(value, "model_dump") and callable(value.model_dump):
-            try:
-                return UnstructuredParser._serialize_metadata_value(value.model_dump())
-            except Exception:
-                pass  # fallthrough to next strategy
-
-        # Handle Pydantic v1 models (retrocompatibilità)
-        if hasattr(value, "dict") and callable(value.dict) and not isinstance(value, dict):
-            try:
-                return UnstructuredParser._serialize_metadata_value(value.dict())
-            except Exception:
-                pass  # fallthrough to next strategy
-
-        # Handle dataclasses (CoordinatesMetadata è un dataclass)
-        if dataclasses.is_dataclass(value) and not isinstance(value, type):
-            try:
-                return UnstructuredParser._serialize_metadata_value(dataclasses.asdict(value))  # type: ignore[arg-type]
-            except Exception:
-                pass  # fallthrough to next strategy
-
-        # Handle generic objects with instance attributes or __slots__.
-        # getattr(obj, "__dict__", {}) and getattr(cls, "__mro__", ()) are used
-        # instead of direct dunder attribute access (value.__dict__, type.__mro__)
-        # and instead of vars() — all forbidden by the AST security scanner.
-        if hasattr(value, "__dict__") or hasattr(type(value), "__slots__"):
-            instance_attrs = getattr(value, "__dict__", {}) or {}
-
-            # Capture attributes declared on __slots__ not present in __dict__
-            slot_attrs = {}
-            for cls in getattr(type(value), "__mro__", ()):
-                for slot in getattr(cls, "__slots__", ()):
-                    if not slot.startswith("_") and slot not in instance_attrs:
-                        try:
-                            slot_attrs[slot] = getattr(value, slot)
-                        except AttributeError:
-                            pass
-
-            serialized = {}
-            for k, v in list({**instance_attrs, **slot_attrs}.items()):  # list() prevents RuntimeError on mutations
-                if not k.startswith("_"):
-                    try:
-                        serialized[k] = UnstructuredParser._serialize_metadata_value(v)
-                    except (TypeError, ValueError):
-                        serialized[k] = str(v)
-            return serialized
-
-        # Handle other basic types
-        if isinstance(value, (str, int, float, bool)):
-            return value
-
-        # For everything else, convert to string as fallback
-        return str(value)
+    def __init__(self, **partition_kwargs: Any) -> None:
+        self._partition_kwargs = partition_kwargs
 
     def lazy_parse(self, blob: Blob) -> Iterator[Document]:
-        suffix = os.path.splitext(blob.source)[1] if blob.source else ""
-        temp_path = None
+        try:
+            from unstructured.partition.auto import partition
+        except ImportError as exc:  # pragma: no cover
+            raise ImportError(
+                "unstructured is required. Add `unstructured[all-docs]>=0.22` "
+                "to requirements.txt."
+            ) from exc
+
+        suffix = os.path.splitext(blob.source or "")[1].lower()
+        temp_path: str | None = None
 
         try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
-                temp_path = temp_file.name
-                temp_file.write(blob.as_bytes())
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                temp_path = tmp.name
+                tmp.write(blob.as_bytes())
 
-            loader = self._document_loader_type(
-                temp_path,
-                strategy="hi_res",
-                extract_images_in_pdf=True,
-                infer_table_structure=True,
-                extract_image_block_types=["Image", "Table"],
-            )
+            kwargs: dict[str, Any] = dict(self._partition_kwargs)
+            # Force content_type for ZIP-based formats to bypass libmagic mis-detection
+            forced_mime = _EXT_TO_MIME.get(suffix)
+            if forced_mime:
+                kwargs["content_type"] = forced_mime
+            # Always pass the original filename so unstructured adds correct metadata
+            kwargs.setdefault("metadata_filename", blob.source or temp_path)
 
-            # Accessing raw elements can return items with None text
-            elements = loader._get_elements()
-
+            elements = partition(filename=temp_path, **kwargs)
             for element in elements:
-                # 1. Extract core attributes safely
-                element_meta = getattr(element, "metadata", None)
-                category = getattr(element, "category", "Uncategorized")
-                raw_text = getattr(element, "text", None)
-                text_as_html = getattr(element_meta, "text_as_html", None)
-
-                # 2. Content Selection Strategy (Optimized for CLIP/Jina AI)
-                # We determine the string representation BEFORE building metadata
-                if category == "Formula":
-                    page_content = text_as_html or getattr(element_meta, "formula", None) or raw_text or "[Formula]"
-                elif category == "Table":
-                    # Jina AI performs best with HTML table structures
-                    page_content = text_as_html or raw_text or "[Table]"
-                elif category == "Image":
-                    # If no OCR text, provide a descriptor for the CLIP embedder
-                    page_content = raw_text or f"Visual element: {category}"
-                else:
-                    # Fallback chain to avoid NoneType __str__ crash
-                    page_content = raw_text or (str(element) if element is not None else None) or f"[{category}]"
-
-                # 3. Skip "Ghost" Elements (No text, no HTML, no Image data)
-                # This prevents polluting your Vector DB with empty entries
-                has_image = hasattr(element_meta, "image_base64")
-                if not page_content.strip() and not has_image:
-                    continue
-
-                # 4. Build enhanced metadata
-                metadata = blob.metadata.copy() if blob.metadata else {}
-                metadata.update({
-                    "element_type": category,
-                    "has_formula": category == "Formula",
-                })
-
-                # Capture specific rich data in metadata
-                if category == "Formula":
-                    metadata["formula_latex"] = page_content
-                elif category == "Table" and text_as_html:
-                    metadata["table_html"] = text_as_html
-                elif category == "Image":
-                    if has_image:
-                        metadata["image_data"] = element_meta.image_base64
-                    if hasattr(element_meta, "image_path"):
-                        metadata["image_path"] = element_meta.image_path
-
-                # Preserve coordinates (SERIALIZED)
-                coords = getattr(element_meta, "coordinates", None)
-                if coords:
-                    # Convert the complex Coordinate object into a dict if possible
-                    coord_data = coords.to_dict() if hasattr(coords, "to_dict") else coords
-                    metadata["coordinates"] = self._serialize_metadata_value(coord_data)
-
-                # Preserve page number
-                page_num = getattr(element_meta, "page_number", None)
-                if page_num is not None:
-                    metadata["page_number"] = int(page_num)
-
-                # Final serialization for DB compatibility
-                metadata = self._serialize_metadata_value(metadata)
-
                 yield Document(
-                    page_content=str(page_content),
-                    metadata=metadata
+                    page_content=str(element),
+                    metadata=element.metadata.to_dict() if hasattr(element.metadata, "to_dict")
+                    else {},
                 )
         finally:
-            if os.path.exists(temp_path):
+            if temp_path and os.path.exists(temp_path):
                 os.unlink(temp_path)
-
-    @property
-    def document_loader_type(self) -> Type[UnstructuredFileLoader]:
-        return self._document_loader_type

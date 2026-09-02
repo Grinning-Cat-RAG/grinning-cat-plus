@@ -24,7 +24,7 @@ The plugin also adds multimodal parsing behavior (notably image handling) when t
 - `requirements.txt`: Python dependencies for all integrations
 - `factories.py`: hook registration for allowed LLMs, embedders, chunkers, and file managers
 - `rabbithole.py`: parser wiring and multimodal parser switching
-- `llm/`: LLM config models and custom adapters
+- `llms/`: LLM config models and custom adapters
 - `embedder/`: embedder config models and custom adapters
 - `chunker/`: chunker config models and implementations
 - `file_manager/`: storage/file manager config models and implementations
@@ -48,6 +48,23 @@ Enabled via `factory_allowed_llms` in `factories.py`:
 - Anthropic
 - Mistral AI
 - Groq
+- OpenRouter (one `api_key` unlocks models from many providers)
+
+### OpenRouter LLM (`LLMOpenRouterConfig`)
+
+- The `model` field is populated dynamically: the settings schema exposes the
+  currently-available OpenRouter model ids as an **enum** (rendered by the admin
+  as a searchable combo), fetched from `https://openrouter.ai/api/v1/models`
+  (cached 15 min in `llms/openrouter.py`).
+- On save, the plugin's `before_llm_settings_update` hook auto-enriches the stored
+  settings with the selected model's capabilities and costs (best-effort — the
+  save never blocks, even if the catalog is unreachable):
+  - `is_multimodal` / `input_modalities` — for the multimodal pipeline;
+  - `max_token_context` / `max_completion_tokens` — for context-window splitting;
+  - `prompt_cost_per_1m`, `completion_cost_per_1m`, `input_cache_read_cost_per_1m`,
+    `request_cost` — per-1M USD prices used for accounting.
+- The core hook `before_llm_settings_update` (no-op in `base_plugin`, called by
+  `ServiceUpdater` before storing LLM settings) is the extension point.
 
 ### Embedders
 
@@ -112,6 +129,8 @@ The parser hook `rabbithole_instantiates_parsers` dynamically switches behavior 
 ### Notable parser details
 
 - `parsers/unstructured_parser.py` enriches metadata with element type, table HTML, formula data, coordinates, page number, and optional image payload
+  - to support all mime types supported by unstructured you must install the packages
+    - libmagic-dev poppler-utils tesseract-ocr tesseract-ocr-{eng,ita} pandoc qpdf "libreoffice-*-nogui"
 - `parsers/youtube_parser.py` fetches transcript text for YouTube sources (languages set to `en` and `it`)
 - `rabbithole.py` downloads NLTK assets (`punkt`, `averaged_perceptron_tagger`) at import time
 
@@ -122,6 +141,8 @@ Because this is a plugin, installation depends on your Grinning Cat/Cheshire Cat
 Typical local flow:
 
 ```bash
+apt install -y --no-install-recommends libmagic-dev poppler-utils tesseract-ocr tesseract-ocr-{eng,ita} pandoc qpdf "libreoffice-*-nogui"
+
 # from your plugin root
 pip install -r requirements.txt
 ```
@@ -132,12 +153,43 @@ Then install/enable the plugin in your host application and select providers fro
 
 Each provider is configured through its corresponding Pydantic settings class under:
 
-- `llm/configs.py`
-- `embedder/configs.py`
-- `chunker/configs.py`
-- `file_manager/configs.py`
+- `llms/configs.py`
+- `embedders/configs.py`
+- `chunkers/configs.py`
+- `file_managers/configs.py`
 
 In the admin UI, these appear using each class `humanReadableName` and expose the required fields (API keys, endpoints, model names, chunking params, etc.).
+
+## vLLM multimodal embedder (server)
+
+When using the vLLM multimodal embedder with a Qwen3-VL model (e.g. `Qwen/Qwen3-VL-Embedding-2B`), the server must be launched with the correct pooling/embedding flags. Multimodal embedding is supported for `Qwen3VLForConditionalGeneration`.
+
+Correct server launch:
+
+```bash
+vllm serve Qwen/Qwen3-VL-Embedding-2B \
+  --runner pooling \
+  --convert embed \
+  --mm-processor-kwargs '{"min_pixels":4096,"max_pixels":1310720}' \
+  --limit-mm-per-prompt '{"image":8}' \
+  --max-model-len <sufficient>
+```
+
+> **Warning:** `--task embed` is **NOT** a vLLM flag. The correct flag to enable the pooling/embedding runner is `--runner pooling`. `--mm-processor-kwargs` overrides the multimodal processor defaults (Qwen3-VL-Embedding-2B ships with `min_pixels=4096`, `max_pixels=1310720`).
+
+### Client behavior
+
+- The plugin always pairs an image with a text part when building the `/v1/embeddings` request.
+- It applies a Qwen3-VL pixel budget on the client side (`max_pixels` default `1_310_720`).
+- If an image is rejected, the plugin retries once with a halved pixel-budget ceiling; if it still fails, the image is skipped (returns `None`) and ingestion continues.
+
+### Troubleshooting `400 Failed to apply Qwen3VLProcessor`
+
+This error is a vLLM wrapper around the Hugging Face processor call. The real cause is chained as `exc.__cause__` in the server log — always read the server log to find the actual exception. Common causes:
+
+- **Insufficient `--max-model-len`**: the image token cost must fit within the model context. As a reference, a `1040x518` image costs roughly `512` tokens. Raise `--max-model-len` accordingly.
+- **Tokenizer `truncation` / `max_length` mismatch**: the served `tokenizer.json` may carry `truncation`/`max_length` settings that conflict with the processor's image-token accounting, producing a "Mismatch in image token count between text and input_ids". Known upstream issues: `vllm-project/vllm#36653` and `llm-compressor#1725`.
+- **Transformers version incompatibility** on the server: verify the installed `transformers` version is compatible with the model and vLLM build.
 
 ## Compatibility notes
 
@@ -164,3 +216,58 @@ From `plugin.json`:
 - Author: `Matteo Cacciola`
 - URL: `https://github.com/matteocacciola/grinning_cat_plus`
 
+## System dependencies
+
+The following system packages must be present in the Docker image or on the host
+running the Cheshire Cat AI instance.
+
+### Required for all deployments
+
+| Package | Purpose |
+|---|---|
+| `libmagic1` / `libmagic-dev` | MIME-type detection used by `unstructured` |
+| `poppler-utils` | PDF rendering (`pdftoppm`, `pdfinfo`) |
+| `libreoffice` | Converts legacy/ODF formats (ODP, ODT, PPT, DOC) to modern equivalents before text extraction |
+
+### Required for OCR and multimodal embedders
+
+| Package | Purpose |
+|---|---|
+| `tesseract-ocr` | OCR engine for images and scanned PDFs |
+| `tesseract-ocr-ita` | Italian language data (add other `tesseract-ocr-*` packs as needed) |
+
+### Required for additional document formats
+
+| Package | Purpose |
+|---|---|
+| `pandoc` ≥ 2.14.2 | Enables `.epub`, `.odt`, and `.rtf` support inside `unstructured` |
+| `ffmpeg` | Audio/video pre-processing for `FasterWhisperParser` |
+
+### Ubuntu / Debian one-liner
+
+```bash
+apt-get update && apt-get install -y \
+    libmagic1 \
+    poppler-utils \
+    libreoffice \
+    tesseract-ocr tesseract-ocr-ita \
+    pandoc \
+    ffmpeg
+```
+
+### Dockerfile snippet
+
+```dockerfile
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libmagic1 \
+    poppler-utils \
+    libreoffice \
+    tesseract-ocr tesseract-ocr-ita \
+    pandoc \
+    ffmpeg \
+ && rm -rf /var/lib/apt/lists/*
+```
+
+> **Note:** `libreoffice` adds roughly 300 MB to the image. If you never upload
+> ODP / ODS / ODT files you may omit it, but the plugin will raise a
+> `RuntimeError` if those MIME types are encountered at runtime.

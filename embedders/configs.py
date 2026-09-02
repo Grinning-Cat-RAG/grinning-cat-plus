@@ -1,7 +1,6 @@
-from typing import Type, Any
+from typing import Type, Any, Literal
 from fastembed import TextEmbedding
 from langchain_cohere import CohereEmbeddings
-from langchain_community.embeddings import FastEmbedEmbeddings
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_mistralai import MistralAIEmbeddings
 from langchain_openai import OpenAIEmbeddings, AzureOpenAIEmbeddings
@@ -11,6 +10,7 @@ from cat.services.factory.embedder import EmbedderSettings, EmbedderMultimodalSe
 from cat.utils import Enum
 
 from .custom import (
+    CustomFastEmbedEmbeddings,
     CustomOpenAIEmbeddings,
     CustomOllamaEmbeddings,
     CustomJinaEmbedder,
@@ -20,6 +20,7 @@ from .custom import (
     Qwen3TEIEmbeddings,
     CustomJinaMultimodalEmbedder,
     JinaCLIPEmbeddings,
+    CustomVllmMultimodalEmbedder,
 )
 
 
@@ -27,6 +28,10 @@ class EmbedderOpenAICompatibleConfig(EmbedderSettings):
     api_key: str | None = None
     model: str
     url: str
+    max_input_tokens: int | None = Field(
+        default=None,
+        description="Maximum input tokens accepted by the embedding model. Used to size chunks that never exceed the embedder. None = unknown/unlimited.",
+    )
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -124,8 +129,8 @@ class EmbedderQdrantFastEmbedConfig(EmbedderSettings):
     )
 
     @classmethod
-    def pyclass(cls) -> Type[FastEmbedEmbeddings]:
-        return FastEmbedEmbeddings
+    def pyclass(cls) -> Type[CustomFastEmbedEmbeddings]:
+        return CustomFastEmbedEmbeddings
 
 
 class EmbedderGeminiChatConfig(EmbedderSettings):
@@ -219,6 +224,10 @@ class EmbedderJinaConfig(EmbedderSettings):
     model: str
     api_key: str
     task: str | None = "text-matching"
+    max_input_tokens: int | None = Field(
+        default=None,
+        description="Maximum input tokens accepted by the embedding model. Used to size chunks that never exceed the embedder. None = unknown/unlimited.",
+    )
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -235,6 +244,10 @@ class EmbedderJinaConfig(EmbedderSettings):
 
 class Qwen3LocalEmbeddingsConfig(EmbedderSettings):
     model_name: str
+    max_input_tokens: int | None = Field(
+        default=None,
+        description="Maximum input tokens accepted by the embedding model. Used to size chunks that never exceed the embedder. None = unknown/unlimited.",
+    )
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -252,6 +265,10 @@ class Qwen3LocalEmbeddingsConfig(EmbedderSettings):
 class Qwen3OllamaEmbeddingsConfig(EmbedderSettings):
     model_name: str
     base_url: str
+    max_input_tokens: int | None = Field(
+        default=None,
+        description="Maximum input tokens accepted by the embedding model. Used to size chunks that never exceed the embedder. None = unknown/unlimited.",
+    )
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -269,6 +286,10 @@ class Qwen3OllamaEmbeddingsConfig(EmbedderSettings):
 class Qwen3DeepInfraEmbeddingsConfig(EmbedderSettings):
     model_name: str
     base_url: str
+    max_input_tokens: int | None = Field(
+        default=None,
+        description="Maximum input tokens accepted by the embedding model. Used to size chunks that never exceed the embedder. None = unknown/unlimited.",
+    )
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -285,6 +306,10 @@ class Qwen3DeepInfraEmbeddingsConfig(EmbedderSettings):
 
 class Qwen3TEIEmbeddingsConfig(EmbedderSettings):
     base_url: str
+    max_input_tokens: int | None = Field(
+        default=None,
+        description="Maximum input tokens accepted by the embedding model. Used to size chunks that never exceed the embedder. None = unknown/unlimited.",
+    )
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -304,6 +329,10 @@ class EmbedderJinaMultimodalConfig(EmbedderMultimodalSettings):
     model: str
     api_key: str
     task: str | None = "text-matching"
+    max_input_tokens: int | None = Field(
+        default=None,
+        description="Maximum input tokens accepted by the embedding model. Used to size chunks that never exceed the embedder. None = unknown/unlimited.",
+    )
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -322,6 +351,10 @@ class JinaCLIPEmbeddingsConfig(EmbedderMultimodalSettings):
     api_key: str
     model_name: str = "jina-clip-v2"
     base_url: str = "https://api.jina.ai/v1/embeddings"
+    max_input_tokens: int | None = Field(
+        default=None,
+        description="Maximum input tokens accepted by the embedding model. Used to size chunks that never exceed the embedder. None = unknown/unlimited.",
+    )
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -334,3 +367,60 @@ class JinaCLIPEmbeddingsConfig(EmbedderMultimodalSettings):
     @classmethod
     def pyclass(cls) -> Type[JinaCLIPEmbeddings]:
         return JinaCLIPEmbeddings
+
+
+class VllmMultimodalConfiguration(EmbedderMultimodalSettings):
+    model: str
+    base_url: str = "http://localhost:8000"
+    api_key: str | None = None
+    timeout: float = 300.0
+    max_image_tokens: int = Field(
+        default=2048,
+        ge=64,
+        description="Max image tokens the embedding model accepts before images are downscaled. Jina v5 omni rejects grids over ~2048; other multimodal models may allow more.",
+    )
+    query_prefix: str = Field(
+        default="Query: ",
+        description="Prefix prepended to query-side text/image inputs (Jina v5 default 'Query: '). Set to '' to disable.",
+    )
+    document_prefix: str = Field(
+        default="Document: ",
+        description="Prefix prepended to document-side text/image inputs (Jina v5 default 'Document: '; some setups use 'Passage: '). Set to '' to disable.",
+    )
+    max_input_tokens: int | None = Field(
+        default=None,
+        ge=256,
+        description="Raw model context window (max_model_len). None (default) auto-detects the value from the vLLM /v1/models endpoint on first use and stores it back here; the per-request budget is then max_input_tokens * context_margin. Set explicitly to override auto-detection (e.g. a smaller window if the server limits it).",
+    )
+    context_margin: float = Field(
+        default=0.9,
+        gt=0.0,
+        le=1.0,
+        description="Fraction of the model's max_model_len used as the per-request token budget when auto-detecting. Headroom absorbs tokenizer overestimation and the input=[[conv]] structure overhead.",
+    )
+    min_pixels: int | None = Field(
+        default=None,
+        ge=1,
+        description="Minimum image pixels the processor keeps (Qwen3-VL preprocessor min_pixels). None (default) uses 4096. Consulted only when image_budget resolves to the pixel budget.",
+    )
+    max_pixels: int | None = Field(
+        default=None,
+        ge=1,
+        description="Maximum image pixels the processor accepts before images are downscaled (Qwen3-VL preprocessor max_pixels). None (default) uses 1_310_720, mirroring Qwen/Qwen3-VL-Embedding-2B preprocessor_config.json; Instruct variants may use 1_505_280 — the client budget must stay <= the server budget. Consulted only when image_budget resolves to the pixel budget.",
+    )
+    image_budget: Literal["auto", "pixels", "grid_tokens"] = Field(
+        default="auto",
+        description="Which image budget guards downscaling. 'auto' uses the pixel budget when the model name contains 'qwen' (case-insensitive) and the legacy grid-token guard (max_image_tokens) otherwise; 'pixels' forces the pixel budget; 'grid_tokens' forces the legacy Jina grid-token guard.",
+    )
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "humanReadableName": "vLLM Multimodal Embedder",
+            "description": "Multimodal embeddings via vLLM's OpenAI-compatible /v1/embeddings endpoint. Sends text chunks and image data URIs as the batch-chat form; returns one vector per input. Auto-detects the model's max_model_len (context length) from /v1/models to keep requests within the running window. Supports Jina v5 omni (and other VLM) embedding models.",
+            "link": "https://docs.vllm.ai/en/latest/models/pooling_models/embed.html",
+        }
+    )
+
+    @classmethod
+    def pyclass(cls) -> Type[CustomVllmMultimodalEmbedder]:
+        return CustomVllmMultimodalEmbedder

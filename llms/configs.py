@@ -1,4 +1,4 @@
-from typing import Type
+from typing import Type, List, Optional
 from langchain_anthropic import ChatAnthropic
 from langchain_cohere import ChatCohere
 from langchain_community.llms import (
@@ -11,10 +11,10 @@ from langchain_mistralai import ChatMistralAI
 from langchain_openai import AzureChatOpenAI
 from langchain_openai import AzureOpenAI
 from langchain_openai import ChatOpenAI, OpenAI
-from pydantic import ConfigDict
+from pydantic import ConfigDict, Field
 from cat.services.factory.llm import LLMSettings
 
-from .custom import CustomOpenAI, CustomOllama
+from .custom import CustomOpenAI, CustomOllama, OpenRouterLLM
 
 
 class LLMOpenAICompatibleConfig(LLMSettings):
@@ -312,3 +312,78 @@ class LLMGroqChatConfig(LLMSettings):
     @classmethod
     def pyclass(cls) -> Type[ChatGroq]:
         return ChatGroq
+
+
+class LLMOpenRouterBaseConfig(LLMSettings):
+    """OpenRouter LLM configuration.
+
+    The ``model`` field is populated at runtime by the plugin's
+    ``factory_allowed_llms`` hook: a subclass is generated whose ``model`` is a
+    ``Literal`` of the currently-available OpenRouter model ids, so the admin UI
+    renders it as a searchable combo.
+
+    On save, the plugin's ``before_llm_settings_update`` hook validates that
+    ``model`` is in the catalog and enriches the stored settings with the model's
+    capabilities (``is_multimodal``, ``max_token_context``, ``max_completion_tokens``)
+    and per-1M-token costs (``prompt_cost_per_1m``, ``completion_cost_per_1m``,
+    ``input_cache_read_cost_per_1m``, ``request_cost``) used for accounting.
+    """
+
+    api_key: str = Field(
+        description="OpenRouter API key.",
+    )
+    model: str = Field(
+        description="OpenRouter model id (e.g. qwen/qwen3.8-27b). The available models are fetched from the OpenRouter catalog and shown as suggestions.",
+    )
+    temperature: float = 0.01
+    streaming: bool = True
+    timeout: int = 120
+
+    # Model capabilities / costs, auto-populated from the OpenRouter catalog on save.
+    # They are stored in the settings so the runtime (multimodal dispatch, context
+    # splitting, accounting) can read them without re-querying the provider.
+    is_multimodal: bool = Field(
+        default=False,
+        description="Whether the selected model accepts image input (auto-populated from the OpenRouter catalog).",
+    )
+    max_token_context: Optional[int] = Field(
+        default=None,
+        description="Model context window in tokens (auto-populated from the OpenRouter catalog).",
+    )
+    max_completion_tokens: Optional[int] = Field(
+        default=None,
+        description="Provider-advertised max output tokens (auto-populated from the OpenRouter catalog).",
+    )
+    input_modalities: List[str] = Field(
+        default_factory=list,
+        description="Input modalities accepted by the model, e.g. ['text', 'image', 'video'] (auto-populated from the OpenRouter catalog).",
+    )
+    prompt_cost_per_1m: Optional[float] = Field(
+        default=None,
+        description="Cost in USD per 1M input tokens (auto-populated from the OpenRouter catalog, for accounting).",
+    )
+    completion_cost_per_1m: Optional[float] = Field(
+        default=None,
+        description="Cost in USD per 1M output tokens (auto-populated from the OpenRouter catalog, for accounting).",
+    )
+    input_cache_read_cost_per_1m: Optional[float] = Field(
+        default=None,
+        description="Cost in USD per 1M cached-input tokens (auto-populated from the OpenRouter catalog, for accounting).",
+    )
+    request_cost: Optional[float] = Field(
+        default=None,
+        description="Flat cost in USD per request, when the provider charges one (auto-populated from the OpenRouter catalog, for accounting).",
+    )
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "humanReadableName": "OpenRouter",
+            "description": "Configuration for OpenRouter: one API key unlocks models from many providers (OpenAI, Anthropic, Google, Mistral, local...). The available models are fetched from OpenRouter and the model capabilities/costs are stored in the settings.",
+            "link": "https://openrouter.ai/models",
+        },
+        extra="allow",
+    )
+
+    @classmethod
+    def pyclass(cls) -> Type[OpenRouterLLM]:
+        return OpenRouterLLM
