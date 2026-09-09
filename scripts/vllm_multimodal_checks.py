@@ -286,8 +286,9 @@ if __name__ == "__main__":
     #     the `if __name__ == "__main__":` guard. This pins the import-safety
     #     contract structurally.
     import ast as _ast
+    from pathlib import Path as _Path
 
-    _tree = _ast.parse(open(__file__).read())
+    _tree = _ast.parse(_Path(__file__).read_text(encoding="utf-8"))
     _executable_top = [
         n for n in _tree.body
         if not (isinstance(n, _ast.Expr) and isinstance(n.value, _ast.Constant))

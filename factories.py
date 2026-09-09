@@ -101,7 +101,6 @@ def _build_openrouter_config() -> Type[LLMOpenRouterBaseConfig]:
     from pydantic import Field
 
     ids = model_ids()
-    model_field = str
     if ids:
         model_field = Field(
             description=LLMOpenRouterBaseConfig.model_fields["model"].description,
