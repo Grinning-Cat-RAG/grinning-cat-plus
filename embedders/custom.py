@@ -4,27 +4,18 @@ import os
 from typing import Any, Dict, List
 import httpx
 import requests
+from fastembed import TextEmbedding
 from sentence_transformers import SentenceTransformer
 
-from langchain_community.embeddings import FastEmbedEmbeddings
 from cat import Embeddings, MultimodalEmbeddings
 from cat.utils import retrieve_image
-
 from cat import log
 from cat.db.database import DEFAULT_SYSTEM_KEY, get_sync_db
 from cat.db.cruds.settings import format_key
 
 _EMBEDDERS_MODELS_CACHE = {}
 
-
 class CustomFastEmbedEmbeddings(Embeddings):
-    """Wrapper for FastEmbedEmbeddings that inherits from cat.Embeddings.
-
-    FastEmbedEmbeddings from langchain_community inherits from langchain_core.embeddings.Embeddings,
-    which is a sibling (not parent) of cat.Embeddings. The factory validation in
-    BaseFactoryConfigModel.get_from_config() requires issubclass(pyclass, cat.Embeddings),
-    so a wrapper is needed to pass the check.
-    """
     def __init__(
         self,
         model_name: str = "BAAI/bge-base-en",
@@ -34,18 +25,15 @@ class CustomFastEmbedEmbeddings(Embeddings):
         max_input_tokens: int | None = None,
     ):
         self.max_input_tokens = max_input_tokens or max_length
-        self._inner = FastEmbedEmbeddings(
-            model_name=model_name,
-            max_length=max_length,
-            doc_embed_type=doc_embed_type,
-            cache_dir=cache_dir,
-        )
+        self.doc_embed_type = doc_embed_type
+        self.model = TextEmbedding(model_name=model_name, max_length=max_length, cache_dir=cache_dir)
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        return self._inner.embed_documents(texts)
+        processed_texts = [f"passage: {t}" for t in texts] if self.doc_embed_type == "passage" else texts
+        return [list(e) for e in self.model.embed(processed_texts)]
 
     def embed_query(self, text: str) -> List[float]:
-        return self._inner.embed_query(text)
+        return [list(e) for e in self.model.embed([text])][0]
 
 
 class CustomOpenAIEmbeddings(Embeddings):

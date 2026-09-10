@@ -1,4 +1,4 @@
-from typing import Type, Any, Literal
+from typing import Type, Literal
 from fastembed import TextEmbedding
 from langchain_cohere import CohereEmbeddings
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
@@ -6,6 +6,7 @@ from langchain_mistralai import MistralAIEmbeddings
 from langchain_openai import OpenAIEmbeddings, AzureOpenAIEmbeddings
 from langchain_voyageai import VoyageAIEmbeddings
 from pydantic import ConfigDict, Field
+
 from cat.services.factory.embedder import EmbedderSettings, EmbedderMultimodalSettings
 from cat.utils import Enum
 
