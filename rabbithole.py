@@ -1,5 +1,4 @@
 import importlib.util
-import os
 import shutil
 import subprocess
 import tempfile
@@ -7,12 +6,10 @@ from pathlib import Path
 from typing import Dict, Iterable, Set
 
 import nltk
-from langchain_community.document_loaders.parsers.audio import FasterWhisperParser
-from langchain_community.document_loaders.parsers.msword import MsWordParser
 from cat import hook, BillTheLizard, EmbedderSettings
 from cat.services.service_factory import ServiceFactory
 
-from .parsers import ExcelParser, OdsParser, PowerPointParser, UnstructuredParser, YoutubeParser
+from .parsers import FasterWhisperParser, ExcelParser, OdsParser, UnstructuredParser, YoutubeParser
 from .parsers.html_preserving_parser import RawHTMLParser
 from .chunkers.custom import HTMLSemanticChunker
 
@@ -174,18 +171,18 @@ async def rabbithole_instantiates_parsers(file_handlers: Dict, cat) -> Dict:
         return file_handlers
 
     is_multimodal = embedder_config.is_multimodal()
-    up_options = {  'strategy':"hi_res", 
-                    'extract_image_block_to_payload':True, 
-                    'extract_image_block_types':["Image", "Table"], 
-                  } if is_multimodal else {
-                    'strategy':"fast",
-                    'extract_images_in_pdf':False,
-                    'infer_table_structure':False,
-                    'extract_image_block_types':[],
-                  }
-    word_parser = MsWordParser() if not is_multimodal else UnstructuredParser(**up_options)
-    powerpoint_parser = PowerPointParser() if not is_multimodal else UnstructuredParser(**up_options)
-
+    up_options = {
+        "strategy": "hi_res",
+        "extract_image_block_to_payload": True,
+        "extract_image_block_types": ["Image", "Table"],
+    } if is_multimodal else {
+        "strategy": "fast",
+        "extract_images_in_pdf": False,
+        "infer_table_structure": False,
+        "extract_image_block_types": [],
+    }
+    word_parser = UnstructuredParser(**up_options)
+    powerpoint_parser = UnstructuredParser(**up_options)
 
     supported = _get_unstructured_supported_mimetypes()
     for mime_type, ft in supported.items():
