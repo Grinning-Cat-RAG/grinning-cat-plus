@@ -7,8 +7,7 @@ from pathlib import Path
 from typing import Dict, Iterable, Set
 
 import nltk
-from langchain_community.document_loaders.parsers.audio import FasterWhisperParser
-from langchain_community.document_loaders.parsers.msword import MsWordParser
+from .parsers.audio_parser import FasterWhisperParser
 from cat import hook, BillTheLizard, EmbedderSettings
 from cat.services.service_factory import ServiceFactory
 
@@ -183,7 +182,7 @@ async def rabbithole_instantiates_parsers(file_handlers: Dict, cat) -> Dict:
                     'infer_table_structure':False,
                     'extract_image_block_types':[],
                   }
-    word_parser = MsWordParser() if not is_multimodal else UnstructuredParser(**up_options)
+    word_parser = UnstructuredParser(**up_options)
     powerpoint_parser = PowerPointParser() if not is_multimodal else UnstructuredParser(**up_options)
 
 
