@@ -4,7 +4,6 @@ import subprocess
 import tempfile
 from pathlib import Path
 from typing import Dict, Iterable, Set
-
 import nltk
 from cat import hook, BillTheLizard, EmbedderSettings
 from cat.services.service_factory import ServiceFactory
@@ -91,9 +90,6 @@ def _libreoffice_convert(source_path: str, target_ext: str) -> str:
     except Exception:
         shutil.rmtree(outdir, ignore_errors=True)
         raise
-
-
-
 
 
 def _register_odf_filetypes() -> None:
