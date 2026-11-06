@@ -1,14 +1,11 @@
 import importlib.util
 import shutil
-import subprocess
-import tempfile
-from pathlib import Path
 from typing import Dict, Iterable, Set
 import nltk
 from cat import hook, BillTheLizard, EmbedderSettings
 from cat.services.service_factory import ServiceFactory
 
-from .parsers import FasterWhisperParser, ExcelParser, OdsParser, PowerPointParser, UnstructuredParser, YoutubeParser
+from .parsers import FasterWhisperParser, ExcelParser, OdpParser, OdsParser, UnstructuredParser, YoutubeParser
 from .parsers.html_preserving_parser import RawHTMLParser
 from .chunkers.custom import HTMLSemanticChunker
 
@@ -28,14 +25,6 @@ _AUDIO_MIME_TYPES: Set[str] = {
     "audio/webm",
 }
 _VIDEO_MIME_TYPES: Set[str] = {"video/mp4"}
-_ZIP_BASED_MIME_TYPES: Set[str] = {
-    "application/vnd.oasis.opendocument.presentation",
-    "application/vnd.oasis.opendocument.spreadsheet",
-    "application/vnd.oasis.opendocument.graphics",
-}
-_ODP_MIME = "application/vnd.oasis.opendocument.presentation"
-_ODS_MIME = "application/vnd.oasis.opendocument.spreadsheet"
-_ODG_MIME = "application/vnd.oasis.opendocument.graphics"
 
 
 def _filetype_is_image(ft) -> bool:
@@ -50,89 +39,7 @@ def _find_spec_or_binary(name: str) -> bool:
     return importlib.util.find_spec(name) is not None or shutil.which(name) is not None
 
 
-def _libreoffice_bin() -> str | None:
-    return shutil.which("libreoffice") or shutil.which("soffice")
-
-
-def _libreoffice_convert(source_path: str, target_ext: str) -> str:
-    binary = _libreoffice_bin()
-    if not binary:
-        raise RuntimeError(
-            "LibreOffice/soffice non trovato nel PATH: necessario per convertire file ODF"
-        )
-
-    src = Path(source_path)
-    outdir = Path(tempfile.mkdtemp(prefix="odf-convert-"))
-    try:
-        cmd = [
-            binary,
-            "--headless",
-            "--convert-to",
-            target_ext,
-            "--outdir",
-            str(outdir),
-            str(src),
-        ]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"Conversione LibreOffice fallita ({proc.returncode}): "
-                f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
-            )
-
-        converted = outdir / f"{src.stem}.{target_ext}"
-        if not converted.exists():
-            files = ", ".join(p.name for p in outdir.iterdir()) if outdir.exists() else "<none>"
-            raise RuntimeError(
-                f"File convertito non trovato: atteso {converted.name}, presenti: {files}"
-            )
-        return str(converted)
-    except Exception:
-        shutil.rmtree(outdir, ignore_errors=True)
-        raise
-
-
-def _register_odf_filetypes() -> None:
-    try:
-        from unstructured.file_utils.filetype import add_file_type
-        from unstructured.file_utils.model import FileType
-    except ImportError:
-        return
-
-    existing_mimes = {getattr(ft, "mime_type", None) for ft in FileType}
-    module_name = __name__
-
-    if _ODP_MIME not in existing_mimes:
-        add_file_type(
-            file_type_name="ODP",
-            canonical_mime_type=_ODP_MIME,
-            importable_package_dependencies=[],
-            extra_name="odf",
-            extensions=[".odp"],
-            partitioner_shortname=module_name,
-        )
-    if _ODS_MIME not in existing_mimes:
-        add_file_type(
-            file_type_name="ODS",
-            canonical_mime_type=_ODS_MIME,
-            importable_package_dependencies=[],
-            extra_name="odf",
-            extensions=[".ods"],
-            partitioner_shortname=module_name,
-        )
-    if _ODG_MIME not in existing_mimes:
-        add_file_type(
-            file_type_name="ODG",
-            canonical_mime_type=_ODG_MIME,
-            importable_package_dependencies=[],
-            extra_name="odf",
-            extensions=[".odg"],
-            partitioner_shortname=module_name,
-        )
-
-
 def _get_unstructured_supported_mimetypes() -> Dict[str, object]:
-    _register_odf_filetypes()
     try:
         from unstructured.file_utils.model import FileType
     except ImportError:
@@ -178,7 +85,7 @@ async def rabbithole_instantiates_parsers(file_handlers: Dict, cat) -> Dict:
         "extract_image_block_types": [],
     }
     word_parser = UnstructuredParser(**up_options)
-    powerpoint_parser = PowerPointParser() if not is_multimodal else UnstructuredParser(**up_options)
+    powerpoint_parser = UnstructuredParser(**up_options)
 
     supported = _get_unstructured_supported_mimetypes()
     for mime_type, ft in supported.items():
@@ -200,7 +107,8 @@ async def rabbithole_instantiates_parsers(file_handlers: Dict, cat) -> Dict:
         "application/vnd.ms-excel": ExcelParser(),
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ExcelParser(),
         "application/vnd.oasis.opendocument.text": word_parser,
-        "application/vnd.oasis.opendocument.presentation": powerpoint_parser,
+        # unstructured has no ODP partitioner: convert to PPTX, then parse like PowerPoint.
+        "application/vnd.oasis.opendocument.presentation": OdpParser(powerpoint_parser),
         "application/vnd.oasis.opendocument.spreadsheet": OdsParser(),
     })
 

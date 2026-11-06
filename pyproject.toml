@@ -35,3 +35,14 @@ dependencies = [
     "xlrd==2.0.2",
     "youtube-transcript-api==1.2.4",
 ]
+
+[dependency-groups]
+dev = [
+    "hypothesis==6.140.2",
+    "pytest==8.4.2",
+    "pytest-cov==7.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
