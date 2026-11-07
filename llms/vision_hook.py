@@ -1,10 +1,9 @@
 """LLM vision gate: keep recalled images away from text-only chat LLMs.
 
-The core ``multimodal_ingestion`` plugin attaches the recalled memory images to
-the agentic workflow as ``image_url`` content parts, but only after asking the
-``llm_vision_capable`` hook whether the configured chat LLM can accept image
-content. The core's default returns the initial value unchanged (``True`` when
-the embedder is multimodal), which means a text-only LLM would receive images
+A plugin could attach the recalled memory images to the agentic workflow as ``image_url``
+content parts, but only after asking the ``llm_vision_capable`` hook whether the configured
+chat LLM can accept image content. The core's default returns the initial value unchanged
+(``True`` when the embedder is multimodal), which means a text-only LLM would receive images
 and fail.
 
 This module implements that hook for the LLMs configured by MyPLUS: when the
