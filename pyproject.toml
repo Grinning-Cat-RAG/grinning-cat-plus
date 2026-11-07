@@ -1,5 +1,6 @@
 [project]
 name = "grinning-cat-plus"
+description = "Introduce new LLMs, Embedders, Chunkers, File Managers, Parsers. It includes multimodal capabilities to the Grinning Cat framework, enabling the processing of images."
 version = "0.1.0"
 requires-python = ">=3.11,<3.14"
 dependencies = [
@@ -34,3 +35,14 @@ dependencies = [
     "xlrd==2.0.2",
     "youtube-transcript-api==1.2.4",
 ]
+
+[dependency-groups]
+dev = [
+    "hypothesis==6.140.2",
+    "pytest==8.4.2",
+    "pytest-cov==7.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

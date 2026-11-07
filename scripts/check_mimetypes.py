@@ -1,7 +1,8 @@
 """
-Diagnostic script: lists all FileType entries from unstructured (including
-ODP/ODS/ODG registered by this plugin) and compares them with what the plugin
-would actually register in rabbithole_instantiates_parsers.
+Diagnostic script: lists all FileType entries from unstructured and compares
+them with what the plugin would actually register in
+rabbithole_instantiates_parsers (labels are the parser class names; kept in
+sync with rabbithole.py by tests/test_rabbithole.py).
 
 Run inside the container:
     python check_mimetypes.py
@@ -51,23 +52,14 @@ _AUDIO_MIME_TYPES: Set[str] = {
 }
 _VIDEO_MIME_TYPES: Set[str] = {"video/mp4"}
 
-# Parser labels used in the "plugin view" table
-_WORD_PARSERS       = {"MsWordParser", "UnstructuredParser(word)"}
-_PPT_PARSERS        = {"PowerPointParser", "UnstructuredParser(ppt)"}
-_EXCEL_PARSERS      = {"TableParser", "UnstructuredParser(excel)"}
-
 
 # ── unstructured scan ─────────────────────────────────────────────────────────
 
 def _get_all_filetypes():
     """Return dict mime→FileType for every partitionable FileType (env deps satisfied)."""
     try:
-        # Try to call plugin's registration first
-        from cat.plugins.grinning_cat_plus.rabbithole import (
-            _register_odf_filetypes,
-            _get_unstructured_supported_mimetypes,
-        )
-        _register_odf_filetypes()
+        # Prefer the plugin's own scan when running inside the Cat
+        from cat.plugins.grinning_cat_plus.rabbithole import _get_unstructured_supported_mimetypes
         return _get_unstructured_supported_mimetypes()
     except ImportError:
         pass
@@ -99,10 +91,8 @@ def _simulate_plugin(supported: Dict[str, object], is_multimodal: bool = False) 
     using string labels instead of real parser instances.
     Returns dict mime→parser_label.
     """
-    word_label  = "UnstructuredParser" if is_multimodal else "MsWordParser"
-    ppt_label   = "UnstructuredParser" if is_multimodal else "PowerPointParser"
-    excel_label = "UnstructuredParser" if is_multimodal else "TableParser"
-    fast_label  = "UnstructuredParser" if is_multimodal else "UnstructuredParser(fast)"
+    unstructured = "UnstructuredParser"  # "hi_res" if multimodal, else "fast"; process_attachments=False
+    convert = "LibreOfficeConversionParser"  # DOC/PPT/ODP: LibreOffice, then UnstructuredParser
 
     handlers: Dict[str, str] = {}
 
@@ -116,27 +106,26 @@ def _simulate_plugin(supported: Dict[str, object], is_multimodal: bool = False) 
             continue
         if mime_type in handlers:
             continue
-        handlers[mime_type] = "UnstructuredParser" if is_multimodal else fast_label
+        handlers[mime_type] = unstructured
 
     # Explicit overrides
     handlers.update({
-        "application/msword": word_label,
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": word_label,
-        "application/vnd.ms-powerpoint": ppt_label,
-        "application/vnd.openxmlformats-officedocument.presentationml.presentation": ppt_label,
-        "application/vnd.ms-excel": excel_label,
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": excel_label,
-        "application/vnd.oasis.opendocument.text": word_label,
-        "application/vnd.oasis.opendocument.spreadsheet": excel_label,
-        "application/vnd.oasis.opendocument.presentation": ppt_label,
-        "application/vnd.oasis.opendocument.graphics": "UnstructuredParser" if is_multimodal else fast_label,
+        "application/msword": convert,
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": unstructured,
+        "application/vnd.ms-powerpoint": convert,
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation": unstructured,
+        "application/vnd.ms-excel": "ExcelParser",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "ExcelParser",
+        "application/vnd.oasis.opendocument.text": unstructured,
+        "application/vnd.oasis.opendocument.presentation": convert,
+        "application/vnd.oasis.opendocument.spreadsheet": "OdsParser",
     })
 
     if is_multimodal:
-        handlers["application/pdf"] = "UnstructuredParser"
+        handlers["application/pdf"] = unstructured
         for mime_type, ft in supported.items():
             if _filetype_is_image(ft):
-                handlers[mime_type] = "UnstructuredParser"
+                handlers[mime_type] = unstructured
 
     # Audio / video
     handlers.update({

@@ -28,7 +28,7 @@ The plugin also adds multimodal parsing behavior (notably image handling) when t
 - `embedder/`: embedder config models and custom adapters
 - `chunker/`: chunker config models and implementations
 - `file_manager/`: storage/file manager config models and implementations
-- `parsers/`: parser implementations for PowerPoint, unstructured content, and YouTube
+- `parsers/`: parser implementations for unstructured content, LibreOffice conversion (DOC, PPT, ODP), spreadsheets, audio and YouTube
 
 ## Registered providers
 
@@ -117,6 +117,9 @@ The parser hook `rabbithole_instantiates_parsers` dynamically switches behavior 
 
 - Word (`application/msword`, `application/vnd.openxmlformats-officedocument.wordprocessingml.document`)
 - PowerPoint (`application/vnd.ms-powerpoint`, `application/vnd.openxmlformats-officedocument.presentationml.presentation`)
+- ODP (`application/vnd.oasis.opendocument.presentation`)
+- DOC, PPT and ODP are first converted with LibreOffice (to DOCX / PPTX; isolated profile, 300 s timeout), then parsed like their target format
+- Email content (EML / MSG) reaching an `unstructured`-based parser: only the message is indexed, attachments are not. Note: the core labels uploaded `.eml` files as `text/plain` (its own text parser indexes the raw source) and does not recognise `.msg`; the email parsers are reached when the MIME type is `message/rfc822` / `application/vnd.ms-outlook` (e.g. URL ingestion)
 - Excel (`application/vnd.ms-excel`, `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`)
 - Video (`video/mp4`) via YouTube transcript extraction
 - Audio (`audio/mpeg`, `audio/mp3`, `audio/ogg`, `audio/wav`, `audio/webm`) via `FasterWhisperParser`
@@ -128,11 +131,11 @@ The parser hook `rabbithole_instantiates_parsers` dynamically switches behavior 
 
 ### Notable parser details
 
-- `parsers/unstructured_parser.py` enriches metadata with element type, table HTML, formula data, coordinates, page number, and optional image payload
+- `parsers/unstructured_parser.py` keeps the metadata produced by `unstructured` for each element (page number, coordinates, table HTML, optional image payload, ...). For presentations (PPTX, and PPT / ODP after conversion) it also sets `slide` (the slide number, i.e. unstructured's `page_number`): every chunk built from a presentation carries `slide`, whatever the chunker, and no chunk spans two slides (semantic chunkers cluster within a slide; the core never merges short chunks across slides)
   - to support all mime types supported by unstructured you must install the packages
     - libmagic-dev poppler-utils tesseract-ocr tesseract-ocr-{eng,ita} pandoc qpdf "libreoffice-*-nogui"
 - `parsers/youtube_parser.py` fetches transcript text for YouTube sources (languages set to `en` and `it`)
-- `rabbithole.py` downloads NLTK assets (`punkt`, `averaged_perceptron_tagger`) at import time
+- `rabbithole.py` downloads the NLTK `punkt_tab` data (sentence tokenizer of the NLTK chunker) at import time
 
 ## Installation
 
@@ -227,7 +230,7 @@ running the Cheshire Cat AI instance.
 |---|---|
 | `libmagic1` / `libmagic-dev` | MIME-type detection used by `unstructured` |
 | `poppler-utils` | PDF rendering (`pdftoppm`, `pdfinfo`) |
-| `libreoffice` | Converts legacy/ODF formats (ODP, ODT, PPT, DOC) to modern equivalents before text extraction |
+| `libreoffice` | Converts legacy/ODF formats (DOC, PPT, ODP) to modern equivalents before text extraction |
 
 ### Required for OCR and multimodal embedders
 
@@ -269,5 +272,4 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ```
 
 > **Note:** `libreoffice` adds roughly 300 MB to the image. If you never upload
-> ODP / ODS / ODT files you may omit it, but the plugin will raise a
-> `RuntimeError` if those MIME types are encountered at runtime.
+> DOC / PPT / ODP files you may omit it, but ingesting those formats will then fail.
