@@ -54,10 +54,19 @@ def test_non_utf8_output_does_not_mask_the_failure(fake_soffice, tmp_path):
         libreoffice.convert(_src(tmp_path), "pptx", tmp_path)
 
 
-def test_exit_zero_without_output_raises(fake_soffice, tmp_path):
+def test_exit_zero_without_output_reports_libreoffice_output(fake_soffice, tmp_path):
+    """Real soffice exits 0 on unreadable input: its own message is the only useful diagnostic."""
     fake_soffice.mode("nooutput")
-    with pytest.raises(RuntimeError, match="input.pptx"):
-        libreoffice.convert(_src(tmp_path), "pptx", tmp_path)
+    with pytest.raises(RuntimeError, match=r"slides\.odp.*produced no pptx.*could not be loaded"):
+        libreoffice.convert(_src(tmp_path), "pptx", tmp_path, display_name="slides.odp")
+
+
+def test_messages_name_the_user_file_not_the_internal_one(fake_soffice, tmp_path):
+    fake_soffice.mode("fail")
+    with pytest.raises(RuntimeError) as exc:
+        libreoffice.convert(_src(tmp_path), "pptx", tmp_path, display_name="Relazione è.odp")
+    assert "Relazione è.odp" in str(exc.value)
+    assert "input.odp" not in str(exc.value)
 
 
 def test_timeout_kills_the_whole_process_group(fake_soffice, tmp_path):
@@ -66,30 +75,25 @@ def test_timeout_kills_the_whole_process_group(fake_soffice, tmp_path):
     with pytest.raises(RuntimeError, match="timed out"):
         libreoffice.convert(_src(tmp_path), "pptx", tmp_path, timeout=1)
     assert time.monotonic() - started < 10
-    grandchild = int(fake_soffice.pid_file.read_text())
+    grandchild = fake_soffice.grandchild_pid()
     deadline = time.monotonic() + 5
     while pid_alive(grandchild) and time.monotonic() < deadline:
         time.sleep(0.05)
     assert not pid_alive(grandchild)
 
 
-def test_timeout_without_process_groups_kills_the_child(fake_soffice, tmp_path, monkeypatch):
-    """Platforms without ``os.killpg`` fall back to killing the direct child."""
-    fake_soffice.mode("hang")
-    monkeypatch.delattr(libreoffice.os, "killpg")
-    killed = []
-    real_kill = libreoffice.subprocess.Popen.kill
-
-    def spy_kill(proc):
-        killed.append(proc.pid)
-        real_kill(proc)
-        # The grandchild keeps the pipes open: reap it so communicate() can return.
-        os.kill(int(fake_soffice.pid_file.read_text()), 9)
-
-    monkeypatch.setattr(libreoffice.subprocess.Popen, "kill", spy_kill)
-    with pytest.raises(RuntimeError, match="timed out"):
-        libreoffice.convert(_src(tmp_path), "pptx", tmp_path, timeout=1)
-    assert len(killed) == 1
+def test_descendant_outside_the_group_does_not_hang_the_timeout(fake_soffice, tmp_path, monkeypatch):
+    """A descendant that left the killed process group still holds the pipes:
+    the bounded wait must stay bounded."""
+    fake_soffice.mode("escape")
+    monkeypatch.setattr(libreoffice, "_REAP_TIMEOUT_S", 0.5)
+    started = time.monotonic()
+    try:
+        with pytest.raises(RuntimeError, match="timed out"):
+            libreoffice.convert(_src(tmp_path), "pptx", tmp_path, timeout=1)
+        assert time.monotonic() - started < 10
+    finally:
+        os.kill(fake_soffice.grandchild_pid(), 9)
 
 
 def test_group_already_gone_is_not_an_error(fake_soffice, tmp_path, monkeypatch):
@@ -123,7 +127,7 @@ def test_interrupt_while_waiting_kills_the_group(fake_soffice, tmp_path, monkeyp
     monkeypatch.setattr(libreoffice.subprocess.Popen, "communicate", interrupted)
     with pytest.raises(KeyboardInterrupt):
         libreoffice.convert(_src(tmp_path), "pptx", tmp_path, timeout=30)
-    grandchild = int(fake_soffice.pid_file.read_text())
+    grandchild = fake_soffice.grandchild_pid()
     deadline = time.monotonic() + 5
     while pid_alive(grandchild) and time.monotonic() < deadline:
         time.sleep(0.05)

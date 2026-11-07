@@ -1,6 +1,7 @@
 import asyncio
+import itertools
 import json
-from typing import List, Iterable, Tuple
+from typing import Any, Dict, List, Iterable, Tuple
 from langchain_core.documents import Document
 from langchain_text_splitters import (
     HTMLSemanticPreservingSplitter,
@@ -15,6 +16,23 @@ from .hierarchical_chunker import (
     HierarchicalChunker as HierarchicalSplitter,
     MathAwareHierarchicalChunker as MathAwareHierarchicalSplitter,
 )
+
+
+def _slide_runs(documents: Iterable[Document]) -> List[Tuple[Any, List[Dict[str, Any]]]]:
+    """Group consecutive documents by their ``slide`` (None when absent), as splitter input.
+
+    Semantic chunkers cluster by similarity across their whole input, so a chunk could mix
+    non-adjacent slides: chunking each slide on its own keeps every chunk within one slide.
+    Documents without ``slide`` form runs of None, i.e. one input as before.
+    """
+    return [
+        (slide, [{"text": doc.page_content, "metadata": doc.metadata} for doc in run])
+        for slide, run in itertools.groupby(documents, key=lambda doc: doc.metadata.get("slide"))
+    ]
+
+
+def _with_slide(metadata: Dict[str, Any], slide: Any) -> Dict[str, Any]:
+    return metadata if slide is None else {**metadata, "slide": slide}
 
 
 class SemanticChunker(EmbeddedBaseChunker):
@@ -36,15 +54,13 @@ class SemanticChunker(EmbeddedBaseChunker):
     async def split_documents(self, documents: Iterable[Document]) -> List[Document]:
         await self._ensure_embedder()
 
-        texts = [{"text": doc.page_content, "metadata": doc.metadata} for doc in documents]
-        chunks = self.splitter.chunk(texts)
-
         return [
             Document(
                 page_content=chunk["text"],
-                metadata={"source_chunks": chunk.get("metadata", [])}
+                metadata=_with_slide({"source_chunks": chunk.get("metadata", [])}, slide),
             )
-            for chunk in chunks
+            for slide, texts in _slide_runs(documents)
+            for chunk in self.splitter.chunk(texts)
         ]
 
 
@@ -70,8 +86,14 @@ class HTMLSemanticChunker(BaseChunker):
 
     async def split_documents(self, documents: Iterable[Document]) -> List[Document]:
         docs = list(documents)
+        # split_text works on the text only: give `slide` back (presentations), applied last so a
+        # header named "slide" cannot overwrite it. Other metadata stays the splitter's own.
         return await asyncio.to_thread(
-            lambda: [chunk for doc in docs for chunk in self.splitter.split_text(doc.page_content)]
+            lambda: [
+                Document(page_content=chunk.page_content, metadata=_with_slide(chunk.metadata, doc.metadata.get("slide")))
+                for doc in docs
+                for chunk in self.splitter.split_text(doc.page_content)
+            ]
         )
 
 
@@ -218,17 +240,18 @@ class MathAwareSemanticChunker(EmbeddedBaseChunker):
     async def split_documents(self, documents: Iterable[Document]) -> List[Document]:
         await self._ensure_embedder()
 
-        texts = [{"text": doc.page_content, "metadata": doc.metadata} for doc in documents]
-        chunks = self.splitter.chunk(texts)
-
         return [
             Document(
                 page_content=chunk["text"],
-                metadata={
-                    "source_chunks": chunk.get("metadata", []),
-                    "has_formula": chunk.get("has_formula", False),
-                    "formula_count": chunk.get("formula_count", 0),
-                },
+                metadata=_with_slide(
+                    {
+                        "source_chunks": chunk.get("metadata", []),
+                        "has_formula": chunk.get("has_formula", False),
+                        "formula_count": chunk.get("formula_count", 0),
+                    },
+                    slide,
+                ),
             )
-            for chunk in chunks
+            for slide, texts in _slide_runs(documents)
+            for chunk in self.splitter.chunk(texts)
         ]

@@ -13,6 +13,7 @@ import stat
 import sys
 import tempfile
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -43,6 +44,7 @@ _load_package()
 #   badbytes  -> exit 5 with non-UTF-8 bytes on stderr
 #   hang      -> starts a grandchild that sleeps (pid in $FAKE_SOFFICE_PIDFILE), then becomes a sleep
 #                itself (exec), like the soffice launcher waiting on soffice.bin
+#   escape    -> like hang, but the grandchild runs in its own session (outside the killed group)
 # Every invocation appends its argv to $FAKE_SOFFICE_ARGS (one line per call).
 _FAKE_SOFFICE = textwrap.dedent(
     """\
@@ -64,11 +66,12 @@ _FAKE_SOFFICE = textwrap.dedent(
         { printf 'CONVERTED:'; cat "$src"; } > "$outdir/$stem.$ext"
         exit 0 ;;
       fail) echo "boom" >&2; exit 3 ;;
-      nooutput) exit 0 ;;
+      nooutput) echo "Error: source file could not be loaded" >&2; exit 0 ;;
       badbytes) printf '\\xff\\xfe' >&2; exit 5 ;;
-      hang)
-        sleep 600 &
-        echo $! > "$FAKE_SOFFICE_PIDFILE"
+      hang|escape)
+        # escape: the grandchild leaves the process group (setsid) but keeps the pipes open
+        if [ "$FAKE_SOFFICE_MODE" = escape ]; then setsid sleep 600 & else sleep 600 & fi
+        echo $! > "$FAKE_SOFFICE_PIDFILE.tmp" && mv "$FAKE_SOFFICE_PIDFILE.tmp" "$FAKE_SOFFICE_PIDFILE"
         exec sleep 600 ;;
     esac
     """
@@ -97,6 +100,17 @@ def fake_soffice(tmp_path, monkeypatch):
             monkeypatch.setenv("FAKE_SOFFICE_MODE", value)
 
         @staticmethod
+        def grandchild_pid(deadline_s: float = 5.0) -> int:
+            """Pid of the process started in ``hang`` mode (waits for the script to write it)."""
+            deadline = time.monotonic() + deadline_s
+            while time.monotonic() < deadline:
+                try:
+                    return int(Fake.pid_file.read_text())
+                except (FileNotFoundError, ValueError):
+                    time.sleep(0.02)
+            raise AssertionError("fake soffice never wrote its grandchild pid")
+
+        @staticmethod
         def calls() -> list[str]:
             if not Fake.args_file.exists():
                 return []
@@ -123,5 +137,5 @@ def pid_alive(pid: int) -> bool:
     try:
         with open(f"/proc/{pid}/stat") as fh:
             return fh.read().split()[2] != "Z"
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):  # reaped between open() and read()
         return False

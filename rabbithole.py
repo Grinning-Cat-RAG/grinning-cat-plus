@@ -2,17 +2,24 @@ import importlib.util
 import shutil
 from typing import Dict, Iterable, Set
 import nltk
+import ctranslate2
 from cat import hook, BillTheLizard, EmbedderSettings
 from cat.services.service_factory import ServiceFactory
 
-from .parsers import FasterWhisperParser, ExcelParser, OdpParser, OdsParser, UnstructuredParser, YoutubeParser
+from .parsers import (
+    FasterWhisperParser,
+    ExcelParser,
+    LibreOfficeConversionParser,
+    OdsParser,
+    UnstructuredParser,
+    YoutubeParser,
+)
 from .parsers.html_preserving_parser import RawHTMLParser
 from .chunkers.custom import HTMLSemanticChunker
 
-import ctranslate2
 
-nltk.download("punkt", quiet=True)
-nltk.download("averaged_perceptron_tagger", quiet=True)
+# sentence tokenizer data for TokenNLTKChunker (NLTK >= 3.9 reads `punkt_tab`, not the old `punkt` pickle)
+nltk.download("punkt_tab", quiet=True)
 
 _AUDIO_MIME_TYPES: Set[str] = {
     "audio/flac", "audio/x-flac",
@@ -84,6 +91,11 @@ async def rabbithole_instantiates_parsers(file_handlers: Dict, cat) -> Dict:
         "infer_table_structure": False,
         "extract_image_block_types": [],
     }
+    # unstructured picks the partitioner from the content, not from the MIME label: any of these
+    # parsers may meet an email (EML / MSG) and would partition its attachments itself (DOC / PPT
+    # with its own soffice: shared profile, no timeout). Only the message is indexed; attachments
+    # are not indexed by this plugin.
+    up_options["process_attachments"] = False
     word_parser = UnstructuredParser(**up_options)
     powerpoint_parser = UnstructuredParser(**up_options)
 
@@ -100,15 +112,20 @@ async def rabbithole_instantiates_parsers(file_handlers: Dict, cat) -> Dict:
         file_handlers[mime_type] = UnstructuredParser(**up_options)
 
     file_handlers.update({
-        "application/msword": word_parser,
+        # unstructured would launch soffice itself for DOC / PPT (shared profile, no timeout) and has
+        # no ODP partitioner: convert them first (bounded, isolated), then parse like DOCX / PPTX.
+        "application/msword": LibreOfficeConversionParser(word_parser, source_ext=".doc", target_ext="docx"),
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document": word_parser,
-        "application/vnd.ms-powerpoint": powerpoint_parser,
+        "application/vnd.ms-powerpoint": LibreOfficeConversionParser(
+            powerpoint_parser, source_ext=".ppt", target_ext="pptx"
+        ),
         "application/vnd.openxmlformats-officedocument.presentationml.presentation": powerpoint_parser,
         "application/vnd.ms-excel": ExcelParser(),
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ExcelParser(),
         "application/vnd.oasis.opendocument.text": word_parser,
-        # unstructured has no ODP partitioner: convert to PPTX, then parse like PowerPoint.
-        "application/vnd.oasis.opendocument.presentation": OdpParser(powerpoint_parser),
+        "application/vnd.oasis.opendocument.presentation": LibreOfficeConversionParser(
+            powerpoint_parser, source_ext=".odp", target_ext="pptx"
+        ),
         "application/vnd.oasis.opendocument.spreadsheet": OdsParser(),
     })
 

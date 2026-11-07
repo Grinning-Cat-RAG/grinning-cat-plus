@@ -11,7 +11,7 @@ from langchain_core.documents import Document
 # Formats whose magic bytes resolve to application/zip rather than the real type.
 # We force the correct content_type so unstructured picks the right partitioner.
 # Only formats unstructured can partition: ODP/ODS/ODG have no partitioner there
-# (ODP is converted to PPTX by OdpParser, ODS goes to OdsParser).
+# (ODP is converted to PPTX by LibreOfficeConversionParser, ODS goes to OdsParser).
 _EXT_TO_MIME: dict[str, str] = {
     ".docx":  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ".xlsx":  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -61,12 +61,14 @@ class UnstructuredParser(BaseBlobParser):
             kwargs.setdefault("metadata_filename", blob.source or temp_path)
 
             elements = partition(filename=temp_path, **kwargs)
+            is_presentation = forced_mime == _EXT_TO_MIME[".pptx"]
             for element in elements:
-                yield Document(
-                    page_content=str(element),
-                    metadata=element.metadata.to_dict() if hasattr(element.metadata, "to_dict")
-                    else {},
-                )
+                metadata = element.metadata.to_dict() if hasattr(element.metadata, "to_dict") else {}
+                # Presentations (PPTX, and PPT / ODP after conversion): unstructured numbers the
+                # slides as pages; expose it as ``slide`` too, which the chunkers keep per chunk.
+                if is_presentation and "page_number" in metadata:
+                    metadata["slide"] = metadata["page_number"]
+                yield Document(page_content=str(element), metadata=metadata)
         finally:
             if temp_path and os.path.exists(temp_path):
                 os.unlink(temp_path)
