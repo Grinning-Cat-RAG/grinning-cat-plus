@@ -31,6 +31,7 @@ if __name__ == "__main__":
     import importlib.util
     import sys
     import threading
+    import time
     import types
     from pathlib import Path
 
@@ -48,6 +49,12 @@ if __name__ == "__main__":
 
     # (model_name, kwargs) appended by the fake AutoTokenizer.from_pretrained.
     TOKENIZER_CALLS: list[tuple[str, dict[str, object]]] = []
+
+    # The fake loader sleeps this long BEFORE recording the call, modelling the
+    # real file I/O of a local HF cache read. Without it the fake is pure Python
+    # and the GIL serializes the threads, so case (c) would pass even with the
+    # lock removed; with it, a lock-free implementation loses the race.
+    FAKE_LOAD_DELAY = 0.05
 
     class QuietLogger:
         """Stands in for the CAT log module: no output, no side effects."""
@@ -68,10 +75,16 @@ if __name__ == "__main__":
             return list(text)
 
     class FakeAutoTokenizer:
-        """Records every from_pretrained call and never touches the network."""
+        """Records every from_pretrained call and never touches the network.
+
+        It sleeps ``FAKE_LOAD_DELAY`` before recording, so the call occupies a
+        real time window like a cache read would: concurrent callers that are
+        not serialized by ``_TOKENIZER_LOCK`` all enter it and are all recorded.
+        """
 
         @staticmethod
         def from_pretrained(name, **kwargs):
+            time.sleep(FAKE_LOAD_DELAY)
             TOKENIZER_CALLS.append((name, dict(kwargs)))
             if name == REMOTE_MODEL:
                 raise OSError(f"{name} is not present in the local HuggingFace cache")
