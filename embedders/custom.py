@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import threading
 from typing import Any, Dict, List
 import httpx
 import requests
@@ -14,6 +15,10 @@ from cat.db.database import DEFAULT_SYSTEM_KEY, get_sync_db
 from cat.db.cruds.settings import format_key
 
 _EMBEDDERS_MODELS_CACHE = {}
+# Per-process, per-model tokenizer resolution outcome. Values are either a
+# loaded tokenizer or the "remote" sentinel (see _load_tokenizer).
+_TOKENIZER_CACHE: Dict[str, Any] = {}
+_TOKENIZER_LOCK = threading.Lock()
 
 class CustomFastEmbedEmbeddings(Embeddings):
     def __init__(
@@ -644,31 +649,48 @@ class CustomVllmMultimodalEmbedder(MultimodalEmbeddings):
         The model usually lives on a DIFFERENT host (the vLLM server), so we
         cannot assume a local HF cache. Resolution order:
 
-        1. local HF cache (``AutoTokenizer``) if the model is cached here;
+        1. local HF cache (``AutoTokenizer`` with ``local_files_only=True``) --
+           fully offline, attempted at most ONCE per process per model;
         2. the vLLM server's own ``/tokenize`` endpoint -- the authoritative
            tokenizer of the serving host, used at runtime to count each text;
         3. ``None`` -> callers fall back to a conservative chars/2 estimate.
 
-        The result is memoized; the remote fallback transparently marks that
-        counting must go through the HTTP endpoint (see _estimate_text_tokens).
+        The outcome is memoized in ``_TOKENIZER_CACHE`` (per process, per
+        model) under ``_TOKENIZER_LOCK`` with double-checked locking, so
+        concurrent embedders share a single load attempt. FAILURES are cached
+        too: the ``"remote"`` sentinel is sticky for the process lifetime,
+        which stops every freshly built embedder from retrying the HuggingFace
+        Hub. The sentinel transparently marks that counting must go through
+        the HTTP endpoint (see _estimate_text_tokens).
         """
-        if self._tokenizer is not None:
-            return self._tokenizer
-        try:
-            from transformers import AutoTokenizer
+        cached = _TOKENIZER_CACHE.get(self.model)
+        if cached is not None:
+            self._tokenizer = cached
+            return cached
 
-            self._tokenizer = AutoTokenizer.from_pretrained(
-                self.model, trust_remote_code=True
-            )
-            log.info(f"VLLM_EMBEDDINGS loaded real tokenizer for {self.model} (local cache)")
-            return self._tokenizer
-        except Exception as exc:  # noqa: BLE001 - non-fatal, fall back to remote
-            log.warning(
-                f"VLLM_EMBEDDINGS no local tokenizer for {self.model} "
-                f"(model is remote): will use the vLLM /tokenize endpoint. ({exc})"
-            )
-            self._tokenizer = "remote"  # sentinel: count via the server
-        return self._tokenizer
+        with _TOKENIZER_LOCK:
+            cached = _TOKENIZER_CACHE.get(self.model)
+            if cached is not None:
+                self._tokenizer = cached
+                return cached
+            try:
+                from transformers import AutoTokenizer
+
+                tokenizer = AutoTokenizer.from_pretrained(
+                    self.model, trust_remote_code=True, local_files_only=True
+                )
+                log.info(
+                    f"VLLM_EMBEDDINGS loaded tokenizer for {self.model} from local HF cache"
+                )
+            except Exception as exc:  # noqa: BLE001 - non-fatal, fall back to remote
+                log.warning(
+                    f"VLLM_EMBEDDINGS tokenizer for {self.model} not in local HF cache: "
+                    f"counting via vLLM /tokenize ({exc})"
+                )
+                tokenizer = "remote"  # sentinel: count via the server
+            _TOKENIZER_CACHE[self.model] = tokenizer
+            self._tokenizer = tokenizer
+            return tokenizer
 
     def _estimate_text_tokens(self, text: str) -> int:
         """EXACT token count of ``text`` using the model's real tokenizer.
