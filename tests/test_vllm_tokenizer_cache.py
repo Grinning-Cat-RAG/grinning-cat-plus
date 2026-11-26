@@ -7,7 +7,9 @@ Contract pinned here:
 * when the model is not cached, the ``"remote"`` sentinel is sticky and counts come from the vLLM
   ``/tokenize`` endpoint (mocked);
 * concurrent fresh instances of the same model share a single load (double-checked locking);
-* the first load of one model never blocks the first load of another (per-model locks).
+* the first load of one model never blocks the first load of another (per-model locks);
+* exact ``/tokenize`` counts are memoized process-wide (bounded LRU), so a text counted several
+  times along one ingestion costs a single HTTP call; failures are never memoized.
 
 No network is ever reached: ``transformers``, ``httpx`` and ``requests`` are fakes.
 """
@@ -136,6 +138,7 @@ def custom():
 def _fresh_process_state(custom):
     custom.CustomVllmMultimodalEmbedder._tokenizer_cache.clear()
     custom.CustomVllmMultimodalEmbedder._tokenizer_locks.clear()
+    custom.CustomVllmMultimodalEmbedder._token_count_cache.clear()
     _FakeAutoTokenizer.calls.clear()
     _FakeAutoTokenizer.slow_model_entered.clear()
     _FakeAutoTokenizer.slow_model_release.clear()
@@ -277,3 +280,95 @@ def test_a_slow_load_of_one_model_does_not_block_another_model(custom):
         _FakeAutoTokenizer.slow_model_release.set()
         slow.join(timeout=30)
     assert len(_calls_for(SLOW_MODEL)) == 1
+
+
+# --------------------------------------------------------------------------------------------
+# /tokenize count cache
+# --------------------------------------------------------------------------------------------
+
+
+class _SequencedTokenize:
+    """Fake ``httpx.post`` for /tokenize: records every call, replies from a script or by length."""
+
+    def __init__(self, script=None):
+        self.calls = []
+        self.script = list(script or [])
+
+    def __call__(self, url, json=None, **kwargs):
+        self.calls.append((json["model"], json["prompt"]))
+        outcome = self.script.pop(0) if self.script else None
+        if isinstance(outcome, Exception):
+            raise outcome
+        status = outcome if isinstance(outcome, int) else 200
+        prompt = json["prompt"]
+        return types.SimpleNamespace(status_code=status, json=lambda: {"count": len(prompt)})
+
+
+def test_the_same_text_is_sent_to_tokenize_once_across_fresh_instances(custom, monkeypatch):
+    post = _SequencedTokenize()
+    monkeypatch.setattr(custom.httpx, "post", post)
+
+    counts = [_build(custom, REMOTE_MODEL)._estimate_text_tokens("hello world") for _ in range(5)]
+
+    assert counts == [11] * 5
+    assert post.calls == [(REMOTE_MODEL, "hello world")]
+
+
+def test_embed_documents_counts_a_single_text_once(custom, monkeypatch):
+    """_split_batches and the oversized-item check used to send the same text twice."""
+    post = _SequencedTokenize()
+    monkeypatch.setattr(custom.httpx, "post", post)
+    embedder = _build(custom, REMOTE_MODEL)
+    monkeypatch.setattr(embedder, "_embed", lambda batch, prefix: [[0.0] for _ in batch])
+
+    assert embedder.embed_documents(["a short document"]) == [[0.0]]
+    assert post.calls == [(REMOTE_MODEL, "a short document")]
+
+
+def test_counts_are_keyed_by_model(custom, monkeypatch):
+    post = _SequencedTokenize()
+    monkeypatch.setattr(custom.httpx, "post", post)
+    monkeypatch.setattr(custom.CustomVllmMultimodalEmbedder, "_tokenizer_cache", {"other/model": "remote"})
+
+    _build(custom, REMOTE_MODEL)._estimate_text_tokens("same text")
+    _build(custom, "other/model")._estimate_text_tokens("same text")
+
+    assert post.calls == [(REMOTE_MODEL, "same text"), ("other/model", "same text")]
+
+
+@pytest.mark.parametrize("failure", [ConnectionError("vLLM down"), 503])
+def test_a_failed_count_is_not_memoized(custom, monkeypatch, failure):
+    post = _SequencedTokenize(script=[failure])
+    monkeypatch.setattr(custom.httpx, "post", post)
+    embedder = _build(custom, REMOTE_MODEL)
+
+    assert embedder._estimate_text_tokens("x" * 40) == 20  # chars/2 while the endpoint fails
+    assert embedder._estimate_text_tokens("x" * 40) == 40  # next call asks again and gets the exact count
+    assert embedder._estimate_text_tokens("x" * 40) == 40  # now memoized
+    assert len(post.calls) == 2
+
+
+def test_the_count_cache_is_bounded_lru(custom, monkeypatch):
+    post = _SequencedTokenize()
+    monkeypatch.setattr(custom.httpx, "post", post)
+    monkeypatch.setattr(custom.CustomVllmMultimodalEmbedder, "_TOKEN_COUNT_CACHE_SIZE", 2)
+    embedder = _build(custom, REMOTE_MODEL)
+
+    for text in ("a", "b", "a", "c"):  # "a" is refreshed, so "b" is the one evicted by "c"
+        embedder._estimate_text_tokens(text)
+    assert len(custom.CustomVllmMultimodalEmbedder._token_count_cache) == 2
+    calls_before = len(post.calls)
+
+    embedder._estimate_text_tokens("a")
+    assert len(post.calls) == calls_before
+    embedder._estimate_text_tokens("b")
+    assert len(post.calls) == calls_before + 1
+
+
+def test_the_count_cache_never_stores_the_text(custom, monkeypatch):
+    monkeypatch.setattr(custom.httpx, "post", _SequencedTokenize())
+    secret = "confidential paragraph"
+
+    _build(custom, REMOTE_MODEL)._estimate_text_tokens(secret)
+
+    assert all(secret not in map(str, key) for key in custom.CustomVllmMultimodalEmbedder._token_count_cache)

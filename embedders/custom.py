@@ -1,7 +1,9 @@
 import base64
+import hashlib
 import json
 import os
 import threading
+from collections import OrderedDict
 from typing import Any, Dict, List
 import httpx
 import requests
@@ -451,6 +453,56 @@ class CustomVllmMultimodalEmbedder(MultimodalEmbeddings):
                 lock = cls._tokenizer_locks[model] = threading.Lock()
             return lock
 
+    # Exact counts returned by vLLM /tokenize, shared process-wide. The same
+    # text is counted several times along one ingestion (by the chunker, by
+    # _split_batches, by the oversized-item check in embed_documents), so
+    # without this every repeat is another HTTP round-trip. Keys are
+    # (base_url, model, sha256(text)) so the text itself is never retained;
+    # bounded LRU. Only exact server counts are cached: the chars/2 fallback
+    # after a failure is not, so a transient outage never sticks.
+    _TOKEN_COUNT_CACHE_SIZE = 4096
+    _token_count_cache: "OrderedDict[tuple[str, str, bytes], int]" = OrderedDict()
+    _token_count_lock = threading.Lock()
+
+    def _remote_token_count(self, text: str) -> int | None:
+        """Exact token count from the vLLM ``/tokenize`` endpoint, memoized.
+
+        Returns ``None`` when the endpoint fails or returns no count.
+        """
+        key = (self.base_url, self.model, hashlib.sha256(text.encode("utf-8")).digest())
+        cache = self._token_count_cache
+        with self._token_count_lock:
+            count = cache.get(key)
+            if count is not None:
+                cache.move_to_end(key)
+                return count
+
+        # The HTTP call runs outside the lock: two threads may count the same
+        # new text concurrently, which is harmless (same result, last write wins).
+        try:
+            r = httpx.post(
+                self.base_url + "/tokenize",
+                json={"model": self.model, "prompt": text},
+                headers=self.headers,
+                timeout=min(self.timeout, 10),
+            )
+            if r.status_code != 200:
+                return None
+            count = r.json().get("count")
+            if not count:
+                return None
+            count = max(1, int(count))
+        except Exception as exc:  # noqa: BLE001 - non-fatal
+            log.debug(f"VLLM_EMBEDDINGS /tokenize failed: {exc}")
+            return None
+
+        with self._token_count_lock:
+            cache[key] = count
+            cache.move_to_end(key)
+            while len(cache) > self._TOKEN_COUNT_CACHE_SIZE:
+                cache.popitem(last=False)
+        return count
+
     def __init__(
         self,
         base_url: str,
@@ -718,7 +770,8 @@ class CustomVllmMultimodalEmbedder(MultimodalEmbeddings):
         Uses the local HF tokenizer when available; otherwise (no local
         tokenizer, or its ``encode`` fails) asks the remote vLLM server's
         ``/tokenize`` endpoint, which returns the exact count
-        (``{"count": N, ...}``) for the model it serves. Falls back to a
+        (``{"count": N, ...}``) for the model it serves; those counts are
+        memoized process-wide (see _remote_token_count). Falls back to a
         conservative ~2 chars/token estimate only when both are unavailable.
         """
         tok = self._tokenizer
@@ -731,20 +784,9 @@ class CustomVllmMultimodalEmbedder(MultimodalEmbeddings):
             except Exception as exc:  # noqa: BLE001 - non-fatal, fall back to remote
                 log.debug(f"VLLM_EMBEDDINGS local tokenizer failed, trying /tokenize: {exc}")
 
-        try:
-            r = httpx.post(
-                self.base_url + "/tokenize",
-                json={"model": self.model, "prompt": text},
-                headers=self.headers,
-                timeout=min(self.timeout, 10),
-            )
-            if r.status_code == 200:
-                count = r.json().get("count")
-                if count:
-                    return max(1, int(count))
-        except Exception as exc:  # noqa: BLE001 - non-fatal
-            log.debug(f"VLLM_EMBEDDINGS /tokenize failed: {exc}")
-
+        count = self._remote_token_count(text)
+        if count is not None:
+            return count
         return max(1, len(text) // 2)
 
     def _estimate_tokens(self, text: str) -> int:
