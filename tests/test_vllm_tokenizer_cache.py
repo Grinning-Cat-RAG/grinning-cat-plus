@@ -27,6 +27,7 @@ MODULE_NAME = "grinning_cat_plus_embedders_custom_under_test"
 
 LOCAL_MODEL = "jinaai/jina-embeddings-v5-omni-small"
 REMOTE_MODEL = "jinaai/not-in-local-cache"
+BROKEN_ENCODE_MODEL = "jinaai/encode-raises"
 SLOW_MODEL = "jinaai/slow-to-load"
 
 # An explicit override makes __init__ skip the /v1/models probe entirely.
@@ -43,6 +44,11 @@ class _FakeTokenizer:
 
     def encode(self, text):
         return list(text)
+
+
+class _BrokenTokenizer:
+    def encode(self, text):
+        raise ValueError("encode failed")
 
 
 class _FakeAutoTokenizer:
@@ -62,6 +68,8 @@ class _FakeAutoTokenizer:
         cls.calls.append((name, dict(kwargs)))
         if name == REMOTE_MODEL:
             raise OSError(f"{name} is not present in the local HuggingFace cache")
+        if name == BROKEN_ENCODE_MODEL:
+            return _BrokenTokenizer()
         return _FakeTokenizer()
 
 
@@ -183,6 +191,41 @@ def test_remote_sentinel_is_sticky_and_counts_come_from_vllm_tokenize(custom, mo
     assert posted == ["http://127.0.0.1:9/tokenize"] * 2
     assert len(_calls_for(REMOTE_MODEL)) == 1, "the 'remote' sentinel must stop further load attempts"
     assert custom._TOKENIZER_CACHE[REMOTE_MODEL] == "remote"
+
+
+def _mock_tokenize(custom, monkeypatch, response):
+    posted = []
+
+    def fake_post(url, **kwargs):
+        posted.append(url)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monkeypatch.setattr(custom.httpx, "post", fake_post)
+    return posted
+
+
+class _CountResponse:
+    status_code = 200
+
+    @staticmethod
+    def json():
+        return {"count": 5}
+
+
+def test_a_failing_local_encode_falls_back_to_vllm_tokenize(custom, monkeypatch):
+    posted = _mock_tokenize(custom, monkeypatch, _CountResponse())
+
+    assert _build(custom, BROKEN_ENCODE_MODEL)._estimate_text_tokens("abcdefghij") == 5
+    assert posted == ["http://127.0.0.1:9/tokenize"]
+
+
+def test_chars_estimate_is_used_only_when_tokenize_is_unreachable(custom, monkeypatch):
+    posted = _mock_tokenize(custom, monkeypatch, ConnectionError("vLLM down"))
+
+    assert _build(custom, REMOTE_MODEL)._estimate_text_tokens("x" * 100) == 50
+    assert posted == ["http://127.0.0.1:9/tokenize"]
 
 
 def test_concurrent_fresh_instances_share_a_single_load(custom):

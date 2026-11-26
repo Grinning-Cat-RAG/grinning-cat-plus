@@ -711,35 +711,35 @@ class CustomVllmMultimodalEmbedder(MultimodalEmbeddings):
     def _estimate_text_tokens(self, text: str) -> int:
         """EXACT token count of ``text`` using the model's real tokenizer.
 
-        Uses the local HF tokenizer when available; otherwise asks the remote
-        vLLM server's ``/tokenize`` endpoint, which returns the exact count
+        Uses the local HF tokenizer when available; otherwise (no local
+        tokenizer, or its ``encode`` fails) asks the remote vLLM server's
+        ``/tokenize`` endpoint, which returns the exact count
         (``{"count": N, ...}``) for the model it serves. Falls back to a
         conservative ~2 chars/token estimate only when both are unavailable.
         """
         tok = self._tokenizer
         if tok is None:
-            tok = self._load_tokenizer()
+            tok = self._load_tokenizer()  # a tokenizer or "remote", never None
 
-        if tok is not None and tok != "remote":
+        if tok != "remote":
             try:
                 return max(1, len(tok.encode(text)))
-            except Exception:  # noqa: BLE001 - non-fatal, fall back to remote
-                pass
+            except Exception as exc:  # noqa: BLE001 - non-fatal, fall back to remote
+                log.debug(f"VLLM_EMBEDDINGS local tokenizer failed, trying /tokenize: {exc}")
 
-        if tok == "remote" or tok is None:
-            try:
-                r = httpx.post(
-                    self.base_url + "/tokenize",
-                    json={"model": self.model, "prompt": text},
-                    headers=self.headers,
-                    timeout=min(self.timeout, 10),
-                )
-                if r.status_code == 200:
-                    count = r.json().get("count")
-                    if count:
-                        return max(1, int(count))
-            except Exception as exc:  # noqa: BLE001 - non-fatal
-                log.debug(f"VLLM_EMBEDDINGS /tokenize failed: {exc}")
+        try:
+            r = httpx.post(
+                self.base_url + "/tokenize",
+                json={"model": self.model, "prompt": text},
+                headers=self.headers,
+                timeout=min(self.timeout, 10),
+            )
+            if r.status_code == 200:
+                count = r.json().get("count")
+                if count:
+                    return max(1, int(count))
+        except Exception as exc:  # noqa: BLE001 - non-fatal
+            log.debug(f"VLLM_EMBEDDINGS /tokenize failed: {exc}")
 
         return max(1, len(text) // 2)
 
