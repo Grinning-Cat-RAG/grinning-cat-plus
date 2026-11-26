@@ -15,22 +15,6 @@ from cat.db.database import DEFAULT_SYSTEM_KEY, get_sync_db
 from cat.db.cruds.settings import format_key
 
 _EMBEDDERS_MODELS_CACHE = {}
-# Per-process, per-model tokenizer resolution outcome. Values are either a
-# loaded tokenizer or the "remote" sentinel (see _load_tokenizer).
-_TOKENIZER_CACHE: Dict[str, Any] = {}
-# One lock per model, so the first load of model A never blocks model B.
-# _TOKENIZER_LOCKS_GUARD only protects the creation of those locks.
-_TOKENIZER_LOCKS: Dict[str, threading.Lock] = {}
-_TOKENIZER_LOCKS_GUARD = threading.Lock()
-
-
-def _tokenizer_lock(model: str) -> threading.Lock:
-    """Return the lock that serializes the first tokenizer load of ``model``."""
-    with _TOKENIZER_LOCKS_GUARD:
-        lock = _TOKENIZER_LOCKS.get(model)
-        if lock is None:
-            lock = _TOKENIZER_LOCKS[model] = threading.Lock()
-        return lock
 
 class CustomFastEmbedEmbeddings(Embeddings):
     def __init__(
@@ -447,6 +431,26 @@ class CustomVllmMultimodalEmbedder(MultimodalEmbeddings):
         (b"BM", "image/bmp"),
     )
 
+    # Tokenizer resolution state, shared by every instance in the process (the
+    # core rebuilds the embedder on each access) and private to this vLLM
+    # embedder: the "remote" sentinel means "count via vLLM /tokenize", which
+    # is meaningless for other providers. Keyed by model name; values are a
+    # loaded tokenizer or "remote" (see _load_tokenizer).
+    _tokenizer_cache: Dict[str, Any] = {}
+    # One lock per model, so the first load of model A never blocks model B.
+    # _tokenizer_locks_guard only protects the creation of those locks.
+    _tokenizer_locks: Dict[str, threading.Lock] = {}
+    _tokenizer_locks_guard = threading.Lock()
+
+    @classmethod
+    def _tokenizer_lock(cls, model: str) -> threading.Lock:
+        """Return the lock that serializes the first tokenizer load of ``model``."""
+        with cls._tokenizer_locks_guard:
+            lock = cls._tokenizer_locks.get(model)
+            if lock is None:
+                lock = cls._tokenizer_locks[model] = threading.Lock()
+            return lock
+
     def __init__(
         self,
         base_url: str,
@@ -670,8 +674,8 @@ class CustomVllmMultimodalEmbedder(MultimodalEmbeddings):
 
         Always returns either a tokenizer or ``"remote"``, never ``None``.
 
-        The outcome is memoized in ``_TOKENIZER_CACHE`` (per process, per
-        model) under a per-model lock with double-checked locking, so
+        The outcome is memoized in ``_tokenizer_cache`` (a class attribute:
+        per process, per model) under a per-model lock with double-checked locking, so
         concurrent embedders share a single load attempt. FAILURES are cached
         too: the ``"remote"`` sentinel is sticky for the process lifetime,
         which stops every freshly built embedder from retrying the load. Any
@@ -679,13 +683,13 @@ class CustomVllmMultimodalEmbedder(MultimodalEmbeddings):
         ``transformers`` missing, broken cache entry...), so populating the HF
         cache after startup only takes effect after a process restart.
         """
-        cached = _TOKENIZER_CACHE.get(self.model)
+        cached = self._tokenizer_cache.get(self.model)
         if cached is not None:
             self._tokenizer = cached
             return cached
 
-        with _tokenizer_lock(self.model):
-            cached = _TOKENIZER_CACHE.get(self.model)
+        with self._tokenizer_lock(self.model):
+            cached = self._tokenizer_cache.get(self.model)
             if cached is not None:
                 self._tokenizer = cached
                 return cached
@@ -704,7 +708,7 @@ class CustomVllmMultimodalEmbedder(MultimodalEmbeddings):
                     f"vLLM /tokenize until restart ({type(exc).__name__}: {exc})"
                 )
                 tokenizer = "remote"  # sentinel: count via the server
-            _TOKENIZER_CACHE[self.model] = tokenizer
+            self._tokenizer_cache[self.model] = tokenizer
             self._tokenizer = tokenizer
             return tokenizer
 

@@ -134,8 +134,8 @@ def custom():
 
 @pytest.fixture(autouse=True)
 def _fresh_process_state(custom):
-    custom._TOKENIZER_CACHE.clear()
-    custom._TOKENIZER_LOCKS.clear()
+    custom.CustomVllmMultimodalEmbedder._tokenizer_cache.clear()
+    custom.CustomVllmMultimodalEmbedder._tokenizer_locks.clear()
     _FakeAutoTokenizer.calls.clear()
     _FakeAutoTokenizer.slow_model_entered.clear()
     _FakeAutoTokenizer.slow_model_release.clear()
@@ -190,7 +190,7 @@ def test_remote_sentinel_is_sticky_and_counts_come_from_vllm_tokenize(custom, mo
     assert counts == [7, 7]
     assert posted == ["http://127.0.0.1:9/tokenize"] * 2
     assert len(_calls_for(REMOTE_MODEL)) == 1, "the 'remote' sentinel must stop further load attempts"
-    assert custom._TOKENIZER_CACHE[REMOTE_MODEL] == "remote"
+    assert custom.CustomVllmMultimodalEmbedder._tokenizer_cache[REMOTE_MODEL] == "remote"
 
 
 def _mock_tokenize(custom, monkeypatch, response):
@@ -250,6 +250,15 @@ def test_concurrent_fresh_instances_share_a_single_load(custom):
     assert not errors, f"worker threads raised: {errors!r}"
     assert counts == [3] * thread_count
     assert len(_calls_for(LOCAL_MODEL)) == 1
+
+
+def test_tokenizer_state_is_private_to_the_vllm_embedder(custom):
+    """Other providers must not see (or share) the vLLM-only "remote" sentinel."""
+    assert not hasattr(custom, "_TOKENIZER_CACHE")
+    for name in dir(custom):
+        cls = getattr(custom, name)
+        if isinstance(cls, type) and cls.__module__ == custom.__name__ and cls is not custom.CustomVllmMultimodalEmbedder:
+            assert "_tokenizer_cache" not in vars(cls), f"{name} must not carry the vLLM tokenizer cache"
 
 
 def test_a_slow_load_of_one_model_does_not_block_another_model(custom):
