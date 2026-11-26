@@ -67,6 +67,7 @@ def _stub_cat() -> dict[str, types.ModuleType]:
     cat.BaseChunker = _BaseChunker
     cat.EmbeddedBaseChunker = _EmbeddedBaseChunker
     cat.Embeddings = object
+    cat.log = types.SimpleNamespace(**{level: (lambda *a, **k: None) for level in ("debug", "info", "warning", "error")})
     services = types.ModuleType("cat.services")
     service_factory = types.ModuleType("cat.services.service_factory")
     service_factory.ServiceFactory = _ServiceFactory

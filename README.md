@@ -123,6 +123,7 @@ The parser hook `rabbithole_instantiates_parsers` dynamically switches behavior 
 - Excel (`application/vnd.ms-excel`, `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`)
 - Video (`video/mp4`) via YouTube transcript extraction
 - Audio (`audio/mpeg`, `audio/mp3`, `audio/ogg`, `audio/wav`, `audio/webm`) via `FasterWhisperParser`
+  - the Whisper model is loaded on the first transcription (not when the parsers are built), once per process per model size / device / compute type, and shared by all audio parsers; it is read from the local Hugging Face cache (`local_files_only=True`) and downloaded only if missing, so a pre-populated cache (`HF_HOME`) means no runtime request to huggingface.co
 
 ### Conditional behavior
 
