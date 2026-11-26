@@ -215,6 +215,18 @@ Useful files while extending the plugin:
 - Implement provider logic: `*/custom.py`
 - Add parser modules: `parsers/`
 
+### Dependencies and `uv.lock`
+
+The plugin ships its `uv.lock`. A core that supports shipped locks installs the plugin strictly from it (dependency groups such as `dev` excluded) and never regenerates it. It refuses the lock, with the reasons in its log, when the lock is out of date with `pyproject.toml` or would install a version of a library other than the one pinned in the core's own `uv.lock`, since all plugins share the core's virtual environment.
+
+So the lock must be resolved against the core's pins, not with a plain `uv lock`. After changing `pyproject.toml`, or when the core's `uv.lock` changes, run from the plugin folder:
+
+```bash
+python scripts/lock_against_core.py /path/to/grinning-cat-core/uv.lock
+```
+
+Locally, use `uv sync --frozen`: a plain `uv sync` would re-lock without the core's constraints.
+
 ## Metadata
 
 From `plugin.json`:
