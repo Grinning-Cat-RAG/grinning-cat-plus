@@ -3,6 +3,7 @@ from typing import Dict, Iterator, Tuple
 
 from langchain_core.documents import Document
 from faster_whisper import WhisperModel
+from huggingface_hub.utils import LocalEntryNotFoundError
 
 from cat import log
 
@@ -18,8 +19,13 @@ class FasterWhisperParser:
 
     Loading is offline-first: the local Hugging Face cache is tried with
     ``local_files_only=True``, which makes no network request. Only when the model is not
-    cached is it downloaded, once. A failed download is not memoized, so the next audio
-    file retries it.
+    cached (``LocalEntryNotFoundError``, raised for a missing or incomplete snapshot) is it
+    downloaded, once. Any other load error (corrupt model file, CUDA error, out of memory,
+    unsupported compute type...) propagates unchanged: downloading would not fix it and
+    would only add a Hub request. Failures are not memoized, so the next audio file retries.
+
+    The shared model uses faster-whisper's default ``num_workers=1``: concurrent
+    transcriptions are safe but run one at a time.
     """
 
     _models: Dict[Tuple[str, str, str], WhisperModel] = {}
@@ -44,7 +50,7 @@ class FasterWhisperParser:
             kwargs = {"device": self.device, "compute_type": self.compute_type}
             try:
                 model = WhisperModel(self.model_size, local_files_only=True, **kwargs)
-            except Exception as exc:  # noqa: BLE001 - not in the local cache: download once
+            except LocalEntryNotFoundError as exc:  # not in the local cache: download once
                 log.info(
                     f"Whisper model {self.model_size!r} not in the local Hugging Face cache "
                     f"({type(exc).__name__}: {exc}), downloading it"

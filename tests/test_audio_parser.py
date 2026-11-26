@@ -10,14 +10,15 @@ import time
 import types
 
 import pytest
+from huggingface_hub.utils import LocalEntryNotFoundError
 from langchain_core.document_loaders import Blob
 
 from grinning_cat_plus.parsers import custom_audio_parser
 from grinning_cat_plus.parsers.custom_audio_parser import FasterWhisperParser
 
 
-class _NotCached(Exception):
-    """Stands in for huggingface_hub's LocalEntryNotFoundError."""
+class _NotCached(LocalEntryNotFoundError):
+    """What faster-whisper raises (via huggingface_hub) for a model missing from the cache."""
 
 
 class _FakeWhisperModel:
@@ -26,10 +27,13 @@ class _FakeWhisperModel:
     calls: list[dict] = []
     cached = True
     download_fails = False
+    local_load_error: Exception | None = None  # a failure of a model that IS cached
 
     def __init__(self, model_size, **kwargs):
         time.sleep(0.02)  # a real load takes time: lets unsynchronized threads overlap
         _FakeWhisperModel.calls.append({"model_size": model_size, **kwargs})
+        if _FakeWhisperModel.local_load_error is not None:
+            raise _FakeWhisperModel.local_load_error
         if kwargs.get("local_files_only") and not _FakeWhisperModel.cached:
             raise _NotCached(f"{model_size} is not in the local cache")
         if not kwargs.get("local_files_only") and _FakeWhisperModel.download_fails:
@@ -47,6 +51,7 @@ def fake_whisper(monkeypatch):
     _FakeWhisperModel.calls = []
     _FakeWhisperModel.cached = True
     _FakeWhisperModel.download_fails = False
+    _FakeWhisperModel.local_load_error = None
 
 
 def _transcribe(parser):
@@ -134,3 +139,22 @@ def test_models_are_keyed_by_size_device_and_compute_type():
         ("small", "cpu", "int8"),
         ("base", "cpu", "float32"),
     ]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("Unsupported model binary version"),  # corrupt or incompatible model.bin
+        RuntimeError("CUDA failed with error out of memory"),
+        ValueError("Requested int8 compute type, but the target device does not support it"),
+    ],
+)
+def test_a_cached_model_that_fails_to_load_is_not_downloaded(error):
+    """Only "not in the cache" justifies a download: any other error must surface as is."""
+    _FakeWhisperModel.local_load_error = error
+
+    with pytest.raises(type(error)) as raised:
+        _transcribe(FasterWhisperParser())
+
+    assert raised.value is error
+    assert [call.get("local_files_only") for call in _FakeWhisperModel.calls] == [True]

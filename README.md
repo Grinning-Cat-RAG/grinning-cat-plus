@@ -122,8 +122,9 @@ The parser hook `rabbithole_instantiates_parsers` dynamically switches behavior 
 - Email content (EML / MSG) reaching an `unstructured`-based parser: only the message is indexed, attachments are not. Note: the core labels uploaded `.eml` files as `text/plain` (its own text parser indexes the raw source) and does not recognise `.msg`; the email parsers are reached when the MIME type is `message/rfc822` / `application/vnd.ms-outlook` (e.g. URL ingestion)
 - Excel (`application/vnd.ms-excel`, `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`)
 - Video (`video/mp4`) via YouTube transcript extraction
-- Audio (`audio/mpeg`, `audio/mp3`, `audio/ogg`, `audio/wav`, `audio/webm`) via `FasterWhisperParser`
-  - the Whisper model is loaded on the first transcription (not when the parsers are built), once per process per model size / device / compute type, and shared by all audio parsers; it is read from the local Hugging Face cache (`local_files_only=True`) and downloaded only if missing, so a pre-populated cache (`HF_HOME`) means no runtime request to huggingface.co
+- Audio (`audio/mpeg`, `audio/mp3`, `audio/ogg`, `audio/wav`, `audio/webm`) and `video/webm` (its audio track) via `FasterWhisperParser`
+  - the Whisper model is loaded on the first transcription (not when the parsers are built), once per process per model size / device / compute type, and shared by all audio parsers; it is read from the local Hugging Face cache (`local_files_only=True`) and downloaded only if missing, so a pre-populated cache (`HF_HOME`) means no runtime request to huggingface.co; any other load error (corrupt model file, CUDA, out of memory) is raised as is, without a download
+  - the shared model runs one transcription at a time (faster-whisper's default `num_workers=1`): concurrent audio uploads are queued rather than transcribed in parallel
 
 ### Conditional behavior
 
