@@ -18,7 +18,19 @@ _EMBEDDERS_MODELS_CACHE = {}
 # Per-process, per-model tokenizer resolution outcome. Values are either a
 # loaded tokenizer or the "remote" sentinel (see _load_tokenizer).
 _TOKENIZER_CACHE: Dict[str, Any] = {}
-_TOKENIZER_LOCK = threading.Lock()
+# One lock per model, so the first load of model A never blocks model B.
+# _TOKENIZER_LOCKS_GUARD only protects the creation of those locks.
+_TOKENIZER_LOCKS: Dict[str, threading.Lock] = {}
+_TOKENIZER_LOCKS_GUARD = threading.Lock()
+
+
+def _tokenizer_lock(model: str) -> threading.Lock:
+    """Return the lock that serializes the first tokenizer load of ``model``."""
+    with _TOKENIZER_LOCKS_GUARD:
+        lock = _TOKENIZER_LOCKS.get(model)
+        if lock is None:
+            lock = _TOKENIZER_LOCKS[model] = threading.Lock()
+        return lock
 
 class CustomFastEmbedEmbeddings(Embeddings):
     def __init__(
@@ -651,24 +663,28 @@ class CustomVllmMultimodalEmbedder(MultimodalEmbeddings):
 
         1. local HF cache (``AutoTokenizer`` with ``local_files_only=True``) --
            fully offline, attempted at most ONCE per process per model;
-        2. the vLLM server's own ``/tokenize`` endpoint -- the authoritative
-           tokenizer of the serving host, used at runtime to count each text;
-        3. ``None`` -> callers fall back to a conservative chars/2 estimate.
+        2. otherwise the ``"remote"`` sentinel: counting goes through the vLLM
+           server's own ``/tokenize`` endpoint, the authoritative tokenizer of
+           the serving host (see _estimate_text_tokens, which also owns the
+           chars/2 fallback used when that endpoint fails).
+
+        Always returns either a tokenizer or ``"remote"``, never ``None``.
 
         The outcome is memoized in ``_TOKENIZER_CACHE`` (per process, per
-        model) under ``_TOKENIZER_LOCK`` with double-checked locking, so
+        model) under a per-model lock with double-checked locking, so
         concurrent embedders share a single load attempt. FAILURES are cached
         too: the ``"remote"`` sentinel is sticky for the process lifetime,
-        which stops every freshly built embedder from retrying the HuggingFace
-        Hub. The sentinel transparently marks that counting must go through
-        the HTTP endpoint (see _estimate_text_tokens).
+        which stops every freshly built embedder from retrying the load. Any
+        exception pins the model to ``/tokenize`` (model not cached,
+        ``transformers`` missing, broken cache entry...), so populating the HF
+        cache after startup only takes effect after a process restart.
         """
         cached = _TOKENIZER_CACHE.get(self.model)
         if cached is not None:
             self._tokenizer = cached
             return cached
 
-        with _TOKENIZER_LOCK:
+        with _tokenizer_lock(self.model):
             cached = _TOKENIZER_CACHE.get(self.model)
             if cached is not None:
                 self._tokenizer = cached
@@ -684,8 +700,8 @@ class CustomVllmMultimodalEmbedder(MultimodalEmbeddings):
                 )
             except Exception as exc:  # noqa: BLE001 - non-fatal, fall back to remote
                 log.warning(
-                    f"VLLM_EMBEDDINGS tokenizer for {self.model} not in local HF cache: "
-                    f"counting via vLLM /tokenize ({exc})"
+                    f"VLLM_EMBEDDINGS no local tokenizer for {self.model}, counting via "
+                    f"vLLM /tokenize until restart ({type(exc).__name__}: {exc})"
                 )
                 tokenizer = "remote"  # sentinel: count via the server
             _TOKENIZER_CACHE[self.model] = tokenizer

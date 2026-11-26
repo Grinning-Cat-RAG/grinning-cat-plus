@@ -186,7 +186,7 @@ vllm serve Qwen/Qwen3-VL-Embedding-2B \
 - It applies a Qwen3-VL pixel budget on the client side (`max_pixels` default `1_310_720`).
 - If an image is rejected, the plugin retries once with a halved pixel-budget ceiling; if it still fails, the image is skipped (returns `None`) and ingestion continues.
 - Token counting uses the model's real tokenizer, loaded from the local HuggingFace cache only (`local_files_only=True`) and memoized once per process per model; when the model is not cached, counts come from the vLLM server's `/tokenize` endpoint — no runtime request ever reaches huggingface.co.
-- To use the local tokenizer, pre-populate the container's HF cache (mount a volume and point `HF_HOME` at it); without it the `/tokenize` fallback stays active and token counts remain exact.
+- To use the local tokenizer, pre-populate the container's HF cache (mount a volume and point `HF_HOME` at it); without it the `/tokenize` fallback stays active and token counts remain exact. The resolution outcome is fixed for the lifetime of the process: after populating the cache, restart the core for the local tokenizer to be picked up.
 
 ### Troubleshooting `400 Failed to apply Qwen3VLProcessor`
 
