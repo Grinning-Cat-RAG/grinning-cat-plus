@@ -1,6 +1,9 @@
 import base64
+import hashlib
 import json
 import os
+import threading
+from collections import OrderedDict
 from typing import Any, Dict, List
 import httpx
 import requests
@@ -430,6 +433,76 @@ class CustomVllmMultimodalEmbedder(MultimodalEmbeddings):
         (b"BM", "image/bmp"),
     )
 
+    # Tokenizer resolution state, shared by every instance in the process (the
+    # core rebuilds the embedder on each access) and private to this vLLM
+    # embedder: the "remote" sentinel means "count via vLLM /tokenize", which
+    # is meaningless for other providers. Keyed by model name; values are a
+    # loaded tokenizer or "remote" (see _load_tokenizer).
+    _tokenizer_cache: Dict[str, Any] = {}
+    # One lock per model, so the first load of model A never blocks model B.
+    # _tokenizer_locks_guard only protects the creation of those locks.
+    _tokenizer_locks: Dict[str, threading.Lock] = {}
+    _tokenizer_locks_guard = threading.Lock()
+
+    @classmethod
+    def _tokenizer_lock(cls, model: str) -> threading.Lock:
+        """Return the lock that serializes the first tokenizer load of ``model``."""
+        with cls._tokenizer_locks_guard:
+            lock = cls._tokenizer_locks.get(model)
+            if lock is None:
+                lock = cls._tokenizer_locks[model] = threading.Lock()
+            return lock
+
+    # Exact counts returned by vLLM /tokenize, shared process-wide. The same
+    # text is counted several times along one ingestion (by the chunker, by
+    # _split_batches, by the oversized-item check in embed_documents), so
+    # without this every repeat is another HTTP round-trip. Keys are
+    # (base_url, model, sha256(text)) so the text itself is never retained;
+    # bounded LRU. Only exact server counts are cached: the chars/2 fallback
+    # after a failure is not, so a transient outage never sticks.
+    _TOKEN_COUNT_CACHE_SIZE = 4096
+    _token_count_cache: "OrderedDict[tuple[str, str, bytes], int]" = OrderedDict()
+    _token_count_lock = threading.Lock()
+
+    def _remote_token_count(self, text: str) -> int | None:
+        """Exact token count from the vLLM ``/tokenize`` endpoint, memoized.
+
+        Returns ``None`` when the endpoint fails or returns no count.
+        """
+        key = (self.base_url, self.model, hashlib.sha256(text.encode("utf-8")).digest())
+        cache = self._token_count_cache
+        with self._token_count_lock:
+            count = cache.get(key)
+            if count is not None:
+                cache.move_to_end(key)
+                return count
+
+        # The HTTP call runs outside the lock: two threads may count the same
+        # new text concurrently, which is harmless (same result, last write wins).
+        try:
+            r = httpx.post(
+                self.base_url + "/tokenize",
+                json={"model": self.model, "prompt": text},
+                headers=self.headers,
+                timeout=min(self.timeout, 10),
+            )
+            if r.status_code != 200:
+                return None
+            count = r.json().get("count")
+            if not count:
+                return None
+            count = max(1, int(count))
+        except Exception as exc:  # noqa: BLE001 - non-fatal
+            log.debug(f"VLLM_EMBEDDINGS /tokenize failed: {exc}")
+            return None
+
+        with self._token_count_lock:
+            cache[key] = count
+            cache.move_to_end(key)
+            while len(cache) > self._TOKEN_COUNT_CACHE_SIZE:
+                cache.popitem(last=False)
+        return count
+
     def __init__(
         self,
         base_url: str,
@@ -644,65 +717,76 @@ class CustomVllmMultimodalEmbedder(MultimodalEmbeddings):
         The model usually lives on a DIFFERENT host (the vLLM server), so we
         cannot assume a local HF cache. Resolution order:
 
-        1. local HF cache (``AutoTokenizer``) if the model is cached here;
-        2. the vLLM server's own ``/tokenize`` endpoint -- the authoritative
-           tokenizer of the serving host, used at runtime to count each text;
-        3. ``None`` -> callers fall back to a conservative chars/2 estimate.
+        1. local HF cache (``AutoTokenizer`` with ``local_files_only=True``) --
+           fully offline, attempted at most ONCE per process per model;
+        2. otherwise the ``"remote"`` sentinel: counting goes through the vLLM
+           server's own ``/tokenize`` endpoint, the authoritative tokenizer of
+           the serving host (see _estimate_text_tokens, which also owns the
+           chars/2 fallback used when that endpoint fails).
 
-        The result is memoized; the remote fallback transparently marks that
-        counting must go through the HTTP endpoint (see _estimate_text_tokens).
+        Always returns either a tokenizer or ``"remote"``, never ``None``.
+
+        The outcome is memoized in ``_tokenizer_cache`` (a class attribute:
+        per process, per model) under a per-model lock with double-checked locking, so
+        concurrent embedders share a single load attempt. FAILURES are cached
+        too: the ``"remote"`` sentinel is sticky for the process lifetime,
+        which stops every freshly built embedder from retrying the load. Any
+        exception pins the model to ``/tokenize`` (model not cached,
+        ``transformers`` missing, broken cache entry...), so populating the HF
+        cache after startup only takes effect after a process restart.
         """
-        if self._tokenizer is not None:
-            return self._tokenizer
-        try:
-            from transformers import AutoTokenizer
+        cached = self._tokenizer_cache.get(self.model)
+        if cached is not None:
+            self._tokenizer = cached
+            return cached
 
-            self._tokenizer = AutoTokenizer.from_pretrained(
-                self.model, trust_remote_code=True
-            )
-            log.info(f"VLLM_EMBEDDINGS loaded real tokenizer for {self.model} (local cache)")
-            return self._tokenizer
-        except Exception as exc:  # noqa: BLE001 - non-fatal, fall back to remote
-            log.warning(
-                f"VLLM_EMBEDDINGS no local tokenizer for {self.model} "
-                f"(model is remote): will use the vLLM /tokenize endpoint. ({exc})"
-            )
-            self._tokenizer = "remote"  # sentinel: count via the server
-        return self._tokenizer
+        with self._tokenizer_lock(self.model):
+            cached = self._tokenizer_cache.get(self.model)
+            if cached is not None:
+                self._tokenizer = cached
+                return cached
+            try:
+                from transformers import AutoTokenizer
+
+                tokenizer = AutoTokenizer.from_pretrained(
+                    self.model, trust_remote_code=True, local_files_only=True
+                )
+                log.info(
+                    f"VLLM_EMBEDDINGS loaded tokenizer for {self.model} from local HF cache"
+                )
+            except Exception as exc:  # noqa: BLE001 - non-fatal, fall back to remote
+                log.warning(
+                    f"VLLM_EMBEDDINGS no local tokenizer for {self.model}, counting via "
+                    f"vLLM /tokenize until restart ({type(exc).__name__}: {exc})"
+                )
+                tokenizer = "remote"  # sentinel: count via the server
+            self._tokenizer_cache[self.model] = tokenizer
+            self._tokenizer = tokenizer
+            return tokenizer
 
     def _estimate_text_tokens(self, text: str) -> int:
         """EXACT token count of ``text`` using the model's real tokenizer.
 
-        Uses the local HF tokenizer when available; otherwise asks the remote
-        vLLM server's ``/tokenize`` endpoint, which returns the exact count
-        (``{"count": N, ...}``) for the model it serves. Falls back to a
+        Uses the local HF tokenizer when available; otherwise (no local
+        tokenizer, or its ``encode`` fails) asks the remote vLLM server's
+        ``/tokenize`` endpoint, which returns the exact count
+        (``{"count": N, ...}``) for the model it serves; those counts are
+        memoized process-wide (see _remote_token_count). Falls back to a
         conservative ~2 chars/token estimate only when both are unavailable.
         """
         tok = self._tokenizer
         if tok is None:
-            tok = self._load_tokenizer()
+            tok = self._load_tokenizer()  # a tokenizer or "remote", never None
 
-        if tok is not None and tok != "remote":
+        if tok != "remote":
             try:
                 return max(1, len(tok.encode(text)))
-            except Exception:  # noqa: BLE001 - non-fatal, fall back to remote
-                pass
+            except Exception as exc:  # noqa: BLE001 - non-fatal, fall back to remote
+                log.debug(f"VLLM_EMBEDDINGS local tokenizer failed, trying /tokenize: {exc}")
 
-        if tok == "remote" or tok is None:
-            try:
-                r = httpx.post(
-                    self.base_url + "/tokenize",
-                    json={"model": self.model, "prompt": text},
-                    headers=self.headers,
-                    timeout=min(self.timeout, 10),
-                )
-                if r.status_code == 200:
-                    count = r.json().get("count")
-                    if count:
-                        return max(1, int(count))
-            except Exception as exc:  # noqa: BLE001 - non-fatal
-                log.debug(f"VLLM_EMBEDDINGS /tokenize failed: {exc}")
-
+        count = self._remote_token_count(text)
+        if count is not None:
+            return count
         return max(1, len(text) // 2)
 
     def _estimate_tokens(self, text: str) -> int:

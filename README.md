@@ -122,7 +122,9 @@ The parser hook `rabbithole_instantiates_parsers` dynamically switches behavior 
 - Email content (EML / MSG) reaching an `unstructured`-based parser: only the message is indexed, attachments are not. Note: the core labels uploaded `.eml` files as `text/plain` (its own text parser indexes the raw source) and does not recognise `.msg`; the email parsers are reached when the MIME type is `message/rfc822` / `application/vnd.ms-outlook` (e.g. URL ingestion)
 - Excel (`application/vnd.ms-excel`, `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`)
 - Video (`video/mp4`) via YouTube transcript extraction
-- Audio (`audio/mpeg`, `audio/mp3`, `audio/ogg`, `audio/wav`, `audio/webm`) via `FasterWhisperParser`
+- Audio (`audio/mpeg`, `audio/mp3`, `audio/ogg`, `audio/wav`, `audio/webm`) and `video/webm` (its audio track) via `FasterWhisperParser`
+  - the Whisper model is loaded on the first transcription (not when the parsers are built), once per process per model size / device / compute type, and shared by all audio parsers; it is read from the local Hugging Face cache (`local_files_only=True`) and downloaded only if missing, so a pre-populated cache (`HF_HOME`) means no runtime request to huggingface.co; any other load error (corrupt model file, CUDA, out of memory) is raised as is, without a download
+  - the shared model runs one transcription at a time (faster-whisper's default `num_workers=1`): concurrent audio uploads are queued rather than transcribed in parallel
 
 ### Conditional behavior
 
@@ -185,6 +187,9 @@ vllm serve Qwen/Qwen3-VL-Embedding-2B \
 - The plugin always pairs an image with a text part when building the `/v1/embeddings` request.
 - It applies a Qwen3-VL pixel budget on the client side (`max_pixels` default `1_310_720`).
 - If an image is rejected, the plugin retries once with a halved pixel-budget ceiling; if it still fails, the image is skipped (returns `None`) and ingestion continues.
+- Token counting uses the model's real tokenizer, loaded from the local HuggingFace cache only (`local_files_only=True`) and memoized once per process per model; when the model is not cached, counts come from the vLLM server's `/tokenize` endpoint — no runtime request ever reaches huggingface.co.
+- To use the local tokenizer, pre-populate the container's HF cache (mount a volume and point `HF_HOME` at it); without it the `/tokenize` fallback stays active and token counts remain exact (if the endpoint is unreachable, a conservative ~2 chars/token estimate is used). The resolution outcome is fixed for the lifetime of the process: after populating the cache, restart the core for the local tokenizer to be picked up.
+- Counts returned by `/tokenize` are memoized per process (bounded LRU of 4096 entries, keyed by a SHA-256 of the text, never the text itself), so a text counted several times during one ingestion costs a single request. Failed requests are not memoized.
 
 ### Troubleshooting `400 Failed to apply Qwen3VLProcessor`
 
@@ -209,6 +214,18 @@ Useful files while extending the plugin:
 - Add a new provider config: `*/configs.py`
 - Implement provider logic: `*/custom.py`
 - Add parser modules: `parsers/`
+
+### Dependencies and `uv.lock`
+
+The plugin ships its `uv.lock`. A core that supports shipped locks installs the plugin strictly from it (dependency groups such as `dev` excluded) and never regenerates it. It refuses the lock, with the reasons in its log, when the lock is out of date with `pyproject.toml` or would install a version of a library other than the one pinned in the core's own `uv.lock`, since all plugins share the core's virtual environment.
+
+So the lock must be resolved against the core's pins, not with a plain `uv lock`. After changing `pyproject.toml`, or when the core's `uv.lock` changes, run from the plugin folder:
+
+```bash
+python scripts/lock_against_core.py /path/to/grinning-cat-core/uv.lock
+```
+
+Locally, use `uv sync --frozen`: a plain `uv sync` would re-lock without the core's constraints.
 
 ## Metadata
 

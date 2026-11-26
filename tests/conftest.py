@@ -14,6 +14,7 @@ import sys
 import tempfile
 import textwrap
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,22 @@ def _load_package() -> None:
 
 
 _load_package()
+
+
+def _stub_cat_log_if_core_missing() -> None:
+    """Parsers log through ``cat.log``: give them a silent one when the core is not installed.
+
+    Only the ``log`` attribute is provided. Tests that need more of the core install their own
+    stub of ``cat`` (with ``monkeypatch``), which replaces this one for their duration.
+    """
+    if "cat" in sys.modules or importlib.util.find_spec("cat") is not None:
+        return
+    cat = types.ModuleType("cat")
+    cat.log = types.SimpleNamespace(**{level: (lambda *a, **k: None) for level in ("debug", "info", "warning", "error")})
+    sys.modules["cat"] = cat
+
+
+_stub_cat_log_if_core_missing()
 
 
 # --------------------------------------------------------------------------------------------
